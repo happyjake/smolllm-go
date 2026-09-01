@@ -166,12 +166,13 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		// Cache counts are provider-reported only; an estimated usage has none.
-		CacheReadTokens:  cr.usage.cacheReadTokens,
-		CacheWriteTokens: cr.usage.cacheWriteTokens,
-		CacheReported:    cr.usage.cacheReported,
-		Duration:         total,
-		TTFT:             cr.ttft,
-		Estimated:        estimated,
+		CacheReadTokens:    cr.usage.cacheReadTokens,
+		CacheWriteTokens:   cr.usage.cacheWriteTokens,
+		CacheReadReported:  cr.usage.cacheReadReported,
+		CacheWriteReported: cr.usage.cacheWriteReported,
+		Duration:           total,
+		TTFT:               cr.ttft,
+		Estimated:          estimated,
 	}
 	if opts.Hook != nil {
 		opts.Hook(RequestEvent{Usage: usage, Error: nil, Timestamp: time.Now().UTC()})

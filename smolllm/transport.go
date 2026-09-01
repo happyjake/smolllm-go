@@ -337,30 +337,33 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 	outputTokens := 0
 	cacheReadTokens := 0
 	cacheWriteTokens := 0
-	cacheReported := false
+	cacheReadReported := false
+	cacheWriteReported := false
 	estimated := true
 	if reported != nil && reported.reported {
 		inputTokens = reported.inputTokens
 		outputTokens = reported.outputTokens
 		cacheReadTokens = reported.cacheReadTokens
 		cacheWriteTokens = reported.cacheWriteTokens
-		cacheReported = reported.cacheReported
+		cacheReadReported = reported.cacheReadReported
+		cacheWriteReported = reported.cacheWriteReported
 		estimated = false
 	}
 	hook(RequestEvent{
 		Usage: Usage{
-			Provider:         call.Provider.Name,
-			Model:            call.Model,
-			ModelName:        call.ModelName,
-			APIKeyHint:       previewAPIKey(call.APIKey),
-			InputTokens:      inputTokens,
-			OutputTokens:     outputTokens,
-			CacheReadTokens:  cacheReadTokens,
-			CacheWriteTokens: cacheWriteTokens,
-			CacheReported:    cacheReported,
-			Duration:         duration,
-			TTFT:             0,
-			Estimated:        estimated,
+			Provider:           call.Provider.Name,
+			Model:              call.Model,
+			ModelName:          call.ModelName,
+			APIKeyHint:         previewAPIKey(call.APIKey),
+			InputTokens:        inputTokens,
+			OutputTokens:       outputTokens,
+			CacheReadTokens:    cacheReadTokens,
+			CacheWriteTokens:   cacheWriteTokens,
+			CacheReadReported:  cacheReadReported,
+			CacheWriteReported: cacheWriteReported,
+			Duration:           duration,
+			TTFT:               0,
+			Estimated:          estimated,
 		},
 		Error:     err,
 		Timestamp: time.Now().UTC(),
@@ -368,8 +371,13 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 }
 
 func requestBodyWithoutStreamUsage(body []byte) ([]byte, bool, error) {
+	// UseNumber for the same reason mergeExtraBody needs it: this rebuilds the
+	// whole payload, so without it the retry silently rounds any integer above
+	// 2^53 that survived the first request.
 	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
 		return nil, false, fmt.Errorf("decode request body for stream_options retry: %w", err)
 	}
 	if _, ok := payload["stream_options"]; !ok {

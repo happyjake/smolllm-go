@@ -56,6 +56,9 @@ func streamOnce(ctx context.Context, prompt Prompt, opts Options, model string) 
 		return nil, err
 	}
 	fail := func(err error) (*StreamResponse, error) {
+		// No usage can exist yet: this fail path runs before the stream is
+		// established. Usage that arrives and is then followed by an error is
+		// preserved by the forwarder, which builds metrics unconditionally.
 		emitFailureHook(opts.Hook, exec.call, err, exec.start, nil)
 		return nil, err
 	}

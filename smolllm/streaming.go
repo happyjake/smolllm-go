@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,7 +36,10 @@ type usageChunk struct {
 	PromptTokens        int `json:"prompt_tokens"`
 	CompletionTokens    int `json:"completion_tokens"`
 	PromptTokensDetails *struct {
-		CachedTokens int `json:"cached_tokens"`
+		// Pointer: the details object also carries unrelated keys such as
+		// audio_tokens, so the object's presence does not mean the provider
+		// said anything about caching.
+		CachedTokens *int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"` // OpenAI, OpenRouter, z.ai, vLLM
 	// Pointers, so an explicitly reported zero is distinguishable from an
 	// absent field. A provider that says cached_tokens:0 is asserting "nothing
@@ -57,8 +59,8 @@ type usageChunk struct {
 // ordinary uncached input, not a billed cache write, and it is derivable as
 // InputTokens - CacheReadTokens.
 func (u *usageChunk) cacheRead() int {
-	if u.PromptTokensDetails != nil {
-		return u.PromptTokensDetails.CachedTokens
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil {
+		return *u.PromptTokensDetails.CachedTokens
 	}
 	if u.PromptCacheHitTokens != nil {
 		return *u.PromptCacheHitTokens
@@ -78,21 +80,29 @@ func (u *usageChunk) cacheWrite() int {
 	return 0
 }
 
-// reportedCache reports whether the provider said anything at all about
-// caching. A consumer needs this to avoid averaging a known zero together with
-// an unknown, which yields a confidently wrong hit rate.
-func (u *usageChunk) reportedCache() bool {
-	return u.PromptTokensDetails != nil || u.PromptCacheHitTokens != nil ||
-		u.CacheReadInputTokens != nil || u.CacheCreationInputTokens != nil
+// reportedCacheRead and reportedCacheWrite are tracked separately: a provider
+// reporting only cache_creation_input_tokens has said nothing about reads, and
+// folding the two together would let a consumer count an unknown read as a
+// known miss.
+func (u *usageChunk) reportedCacheRead() bool {
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil {
+		return true
+	}
+	return u.PromptCacheHitTokens != nil || u.CacheReadInputTokens != nil
+}
+
+func (u *usageChunk) reportedCacheWrite() bool {
+	return u.CacheCreationInputTokens != nil
 }
 
 type reportedUsage struct {
-	inputTokens      int
-	outputTokens     int
-	cacheReadTokens  int
-	cacheWriteTokens int
-	cacheReported    bool
-	reported         bool
+	inputTokens        int
+	outputTokens       int
+	cacheReadTokens    int
+	cacheWriteTokens   int
+	cacheReadReported  bool
+	cacheWriteReported bool
+	reported           bool
 }
 
 func startStreamForwarder(
@@ -186,33 +196,38 @@ func startStreamForwarder(
 			toolCalls:    tools.result(),
 		}
 
-		if err == nil || errors.Is(err, context.Canceled) {
-			combined := contentBuilder.String() + reasoningBuilder.String()
-			inputTokens := call.InputTokens
-			outputTokens := estimateTokens(combined)
-			cacheReadTokens := 0
-			cacheWriteTokens := 0
-			cacheReported := false
-			estimated := true
-			if usage.reported {
-				inputTokens = usage.inputTokens
-				outputTokens = usage.outputTokens
-				cacheReadTokens = usage.cacheReadTokens
-				cacheWriteTokens = usage.cacheWriteTokens
-				cacheReported = usage.cacheReported
-				estimated = false
-			}
-			completion.metrics = &streamMetrics{
-				modelName:        call.ModelName,
-				inputTokens:      inputTokens,
-				outputTokens:     outputTokens,
-				cacheReadTokens:  cacheReadTokens,
-				cacheWriteTokens: cacheWriteTokens,
-				cacheReported:    cacheReported,
-				total:            total,
-				ttft:             ttft,
-				estimated:        estimated,
-			}
+		// Metrics are built even on a hard error: a usage frame that already
+		// arrived carries real token counts, and discarding it makes the failure
+		// hook and the ledger record an estimate for a call the provider
+		// actually accounted for.
+		combined := contentBuilder.String() + reasoningBuilder.String()
+		inputTokens := call.InputTokens
+		outputTokens := estimateTokens(combined)
+		cacheReadTokens := 0
+		cacheWriteTokens := 0
+		cacheReadReported := false
+		cacheWriteReported := false
+		estimated := true
+		if usage.reported {
+			inputTokens = usage.inputTokens
+			outputTokens = usage.outputTokens
+			cacheReadTokens = usage.cacheReadTokens
+			cacheWriteTokens = usage.cacheWriteTokens
+			cacheReadReported = usage.cacheReadReported
+			cacheWriteReported = usage.cacheWriteReported
+			estimated = false
+		}
+		completion.metrics = &streamMetrics{
+			modelName:          call.ModelName,
+			inputTokens:        inputTokens,
+			outputTokens:       outputTokens,
+			cacheReadTokens:    cacheReadTokens,
+			cacheWriteTokens:   cacheWriteTokens,
+			cacheReadReported:  cacheReadReported,
+			cacheWriteReported: cacheWriteReported,
+			total:              total,
+			ttft:               ttft,
+			estimated:          estimated,
 		}
 
 		done <- completion
@@ -339,7 +354,8 @@ func processChunkLineWithMetadata(
 		usage.outputTokens = chunk.Usage.CompletionTokens
 		usage.cacheReadTokens = chunk.Usage.cacheRead()
 		usage.cacheWriteTokens = chunk.Usage.cacheWrite()
-		usage.cacheReported = chunk.Usage.reportedCache()
+		usage.cacheReadReported = chunk.Usage.reportedCacheRead()
+		usage.cacheWriteReported = chunk.Usage.reportedCacheWrite()
 		usage.reported = true
 	}
 	if finishReason != nil && len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != nil {

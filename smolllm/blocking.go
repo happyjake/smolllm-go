@@ -41,12 +41,13 @@ func consumeBlocking(body io.Reader, start time.Time) (consumeResult, error) {
 	var usage reportedUsage
 	if decoded.Usage != nil {
 		usage = reportedUsage{
-			inputTokens:      decoded.Usage.PromptTokens,
-			outputTokens:     decoded.Usage.CompletionTokens,
-			cacheReadTokens:  decoded.Usage.cacheRead(),
-			cacheWriteTokens: decoded.Usage.cacheWrite(),
-			cacheReported:    decoded.Usage.reportedCache(),
-			reported:         true,
+			inputTokens:        decoded.Usage.PromptTokens,
+			outputTokens:       decoded.Usage.CompletionTokens,
+			cacheReadTokens:    decoded.Usage.cacheRead(),
+			cacheWriteTokens:   decoded.Usage.cacheWrite(),
+			cacheReadReported:  decoded.Usage.reportedCacheRead(),
+			cacheWriteReported: decoded.Usage.reportedCacheWrite(),
+			reported:           true,
 		}
 	}
 	if len(decoded.Choices) == 0 {

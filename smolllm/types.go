@@ -215,13 +215,16 @@ type Usage struct {
 	// to cache on this call. Only Anthropic-style endpoints report writes;
 	// elsewhere 0 means "not reported", not "nothing was cached".
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
-	// CacheReported records whether the provider said anything about caching at
-	// all. Without it a zero is ambiguous, and averaging a reported zero with an
-	// unreported one produces a confidently wrong hit rate.
-	CacheReported bool          `json:"cache_reported,omitempty"`
-	Duration      time.Duration `json:"duration"`
-	TTFT          time.Duration `json:"ttft"`
-	Estimated     bool          `json:"estimated"`
+	// CacheReadReported and CacheWriteReported record whether the provider spoke
+	// about reads and writes respectively. Without them a zero is ambiguous, and
+	// averaging a reported zero with an unreported one yields a confidently wrong
+	// hit rate. They are separate because a provider reporting only cache writes
+	// has said nothing about reads.
+	CacheReadReported  bool          `json:"cache_read_reported,omitempty"`
+	CacheWriteReported bool          `json:"cache_write_reported,omitempty"`
+	Duration           time.Duration `json:"duration"`
+	TTFT               time.Duration `json:"ttft"`
+	Estimated          bool          `json:"estimated"`
 }
 
 // RequestEvent is emitted after each LLM call attempt (success or failure).
@@ -267,15 +270,16 @@ type streamCompletion struct {
 }
 
 type streamMetrics struct {
-	modelName        string
-	inputTokens      int
-	outputTokens     int
-	cacheReadTokens  int
-	cacheWriteTokens int
-	cacheReported    bool
-	total            time.Duration
-	ttft             time.Duration
-	estimated        bool
+	modelName          string
+	inputTokens        int
+	outputTokens       int
+	cacheReadTokens    int
+	cacheWriteTokens   int
+	cacheReadReported  bool
+	cacheWriteReported bool
+	total              time.Duration
+	ttft               time.Duration
+	estimated          bool
 }
 
 // Chan exposes the underlying channel of chunks.
@@ -324,7 +328,8 @@ func (s DeltaStream) Wait() error {
 			s.usage.OutputTokens = result.metrics.outputTokens
 			s.usage.CacheReadTokens = result.metrics.cacheReadTokens
 			s.usage.CacheWriteTokens = result.metrics.cacheWriteTokens
-			s.usage.CacheReported = result.metrics.cacheReported
+			s.usage.CacheReadReported = result.metrics.cacheReadReported
+			s.usage.CacheWriteReported = result.metrics.cacheWriteReported
 			s.usage.Duration = result.metrics.total
 			s.usage.TTFT = result.metrics.ttft
 			s.usage.Estimated = result.metrics.estimated

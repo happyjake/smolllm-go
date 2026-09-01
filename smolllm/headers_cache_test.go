@@ -56,7 +56,7 @@ func TestCustomHeadersReachEveryRequestPath(t *testing.T) {
 
 		_, err := Ask(context.Background(), PromptFromString("hi"),
 			WithModel("openai/gpt-5"), WithBaseURL(srv.URL+"/"), WithAPIKey("k"),
-			WithHeader("X-Custom", "yes"))
+			WithHeaderForAllProviders("X-Custom", "yes"))
 		require.NoError(t, err)
 		assertEveryRequestCarried(t, rec, "X-Custom", "yes")
 	})
@@ -83,7 +83,7 @@ func TestCustomHeadersReachEveryRequestPath(t *testing.T) {
 
 		_, err := Ask(context.Background(), PromptFromString("hi"),
 			WithModel("openai/gpt-5"), WithBaseURL(srv.URL+"/"), WithAPIKey("k"),
-			WithHeader("X-Custom", "yes"))
+			WithHeaderForAllProviders("X-Custom", "yes"))
 		require.NoError(t, err)
 		require.GreaterOrEqual(t, len(rec.all()), 2, "expected an initial request and a retry")
 		assertEveryRequestCarried(t, rec, "X-Custom", "yes")
@@ -100,7 +100,7 @@ func TestCustomHeadersReachEveryRequestPath(t *testing.T) {
 
 		stream, err := Stream(context.Background(), PromptFromString("hi"),
 			WithModel("openai/gpt-5"), WithBaseURL(srv.URL+"/"), WithAPIKey("k"),
-			WithHeader("X-Custom", "yes"))
+			WithHeaderForAllProviders("X-Custom", "yes"))
 		require.NoError(t, err)
 		for range stream.Stream.Chan() {
 		}
@@ -120,7 +120,7 @@ func TestCustomHeadersReachEveryRequestPath(t *testing.T) {
 
 		_, err := Embed(context.Background(), []string{"hi"},
 			WithModel("openai/text-embedding-3-small"), WithBaseURL(srv.URL+"/"), WithAPIKey("k"),
-			WithHeader("X-Custom", "yes"))
+			WithHeaderForAllProviders("X-Custom", "yes"))
 		require.NoError(t, err)
 		assertEveryRequestCarried(t, rec, "X-Custom", "yes")
 	})
@@ -139,10 +139,10 @@ func assertEveryRequestCarried(t *testing.T, rec *headerRecorder, name, value st
 
 func TestWithHeaderRejectsReservedNames(t *testing.T) {
 	t.Parallel()
-	assert.Panics(t, func() { WithHeader("Authorization", "Bearer nope") })
-	assert.Panics(t, func() { WithHeader("content-type", "text/plain") })
-	assert.Panics(t, func() { WithHeader("  ", "x") })
-	assert.NotPanics(t, func() { WithHeader("X-Title", "smolllm") })
+	assert.Panics(t, func() { WithHeaderForAllProviders("Authorization", "Bearer nope") })
+	assert.Panics(t, func() { WithHeaderForAllProviders("content-type", "text/plain") })
+	assert.Panics(t, func() { WithHeaderForAllProviders("  ", "x") })
+	assert.NotPanics(t, func() { WithHeaderForAllProviders("X-Title", "smolllm") })
 }
 
 // Prompt-cache usage arrives in three mutually-exclusive dialects. This must
@@ -279,7 +279,7 @@ func TestProviderHeadersDoNotLeakAcrossFallbackLegs(t *testing.T) {
 	_, err := Ask(context.Background(), PromptFromString("hi"),
 		WithModel("alpha/m,beta/m"),
 		WithProviderHeader("alpha", "X-Api-Key", "alpha-secret"),
-		WithHeader("X-Title", "shared"))
+		WithHeaderForAllProviders("X-Title", "shared"))
 	require.NoError(t, err)
 
 	mu.Lock()
@@ -292,12 +292,19 @@ func TestProviderHeadersDoNotLeakAcrossFallbackLegs(t *testing.T) {
 	assert.Equal(t, "shared", seen["second"].Get("X-Title"), "unscoped headers still apply everywhere")
 }
 
-func TestWithHeaderRefusesCredentialLookingNames(t *testing.T) {
+// The dangerous form is the verbosely-named one, and a scoped header is
+// available for every provider identity including bare models.
+func TestHeaderOptionShape(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"X-Api-Key", "x-auth-token", "Cookie", "X-Secret"} {
-		assert.Panicsf(t, func() { WithHeader(name, "v") }, "%s should be refused globally", name)
-		assert.NotPanicsf(t, func() { WithProviderHeader("p", name, "v") }, "%s should be allowed scoped", name)
-	}
+	assert.Panics(t, func() { WithHeaderForAllProviders("Authorization", "x") })
+	assert.Panics(t, func() { WithProviderHeader("p", "Content-Type", "x") })
+	// No name-based refusals any more: Idempotency-Key and X-Token-Count are
+	// safe globally, and guessing secrecy from a name never worked.
+	assert.NotPanics(t, func() { WithHeaderForAllProviders("Idempotency-Key", "abc") })
+	assert.NotPanics(t, func() { WithHeaderForAllProviders("X-Token-Count", "5") })
+	// A bare model resolves to the empty provider identity and must still be
+	// able to carry a scoped credential.
+	assert.NotPanics(t, func() { WithProviderHeader("", "X-Api-Key", "secret") })
 }
 
 // Options is exported, so a custom Option can write ExtraHeaders directly and
@@ -332,19 +339,35 @@ func TestReservedHeadersRejectedAtRequestBuild(t *testing.T) {
 // would be worse than reporting nothing.
 func TestCacheReadHonoursExplicitZero(t *testing.T) {
 	t.Parallel()
-	eighty := 80
+	eighty, zero := 80, 0
 	u := usageChunk{
 		PromptTokensDetails: &struct {
-			CachedTokens int `json:"cached_tokens"`
-		}{CachedTokens: 0},
+			CachedTokens *int `json:"cached_tokens"`
+		}{CachedTokens: &zero},
 		CacheReadInputTokens: &eighty,
 	}
 	assert.Equal(t, 0, u.cacheRead())
-	assert.True(t, u.reportedCache())
+	assert.True(t, u.reportedCacheRead())
+
+	// A details object carrying only unrelated keys says nothing about caching,
+	// so it must not mask a lower-priority dialect that does.
+	masked := usageChunk{
+		PromptTokensDetails: &struct {
+			CachedTokens *int `json:"cached_tokens"`
+		}{},
+		CacheReadInputTokens: &eighty,
+	}
+	assert.Equal(t, 80, masked.cacheRead())
+	assert.True(t, masked.reportedCacheRead())
+
+	// Write-only reporting says nothing about reads.
+	writeOnly := usageChunk{CacheCreationInputTokens: &eighty}
+	assert.False(t, writeOnly.reportedCacheRead())
+	assert.True(t, writeOnly.reportedCacheWrite())
 
 	silent := usageChunk{PromptTokens: 10}
 	assert.Equal(t, 0, silent.cacheRead())
-	assert.False(t, silent.reportedCache(), "a provider that said nothing must not read as a reported zero")
+	assert.False(t, silent.reportedCacheRead(), "a provider that said nothing must not read as a reported zero")
 }
 
 // A blocking response carrying usage but no choices is an error, but its token
