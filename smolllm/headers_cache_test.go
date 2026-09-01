@@ -412,3 +412,27 @@ func TestExtraBodyMergePreservesLargeIntegers(t *testing.T) {
 	assert.Contains(t, string(raw), "9007199254740993",
 		"seed was rounded through the extra-body merge")
 }
+
+// Ask's stream consumer must carry usage out with an error, as the Stream
+// forwarder does: a usage frame that already arrived holds real token counts,
+// and an estimate would be recorded for a call the provider accounted for.
+func TestAskStreamErrorPreservesReportedUsage(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"cache_read_input_tokens\":80}}\n\n"))
+		_, _ = w.Write([]byte("data: {not json at all\n\n"))
+	}))
+	defer srv.Close()
+
+	var event RequestEvent
+	_, err := Ask(context.Background(), PromptFromString("hi"),
+		WithModel("openai/gpt-5"), WithBaseURL(srv.URL+"/"), WithAPIKey("k"),
+		WithHook(func(e RequestEvent) { event = e }))
+	require.Error(t, err)
+	assert.Equal(t, 100, event.InputTokens, "usage that arrived before the error must survive")
+	assert.Equal(t, 80, event.CacheReadTokens)
+	assert.True(t, event.CacheReadReported)
+	assert.False(t, event.Estimated)
+}

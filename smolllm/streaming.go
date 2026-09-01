@@ -264,15 +264,24 @@ func consumeStream(
 	var finishReason string
 	var tools toolCallAccumulator
 
+	// failed carries whatever the provider already told us out with the error.
+	// A usage frame that arrived before a malformed line still holds real token
+	// counts, and returning an empty result makes the failure hook record an
+	// estimate for a call the provider accounted for. The unconditional-metrics
+	// change covered Stream; this is the Ask path.
+	failed := func(err error) (consumeResult, error) {
+		return consumeResult{usage: usage, finishReason: finishReason, toolCalls: tools.result()}, err
+	}
+
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return consumeResult{}, ctx.Err()
+			return failed(ctx.Err())
 		}
 
 		line := scanner.Text()
 		chunk, err := processChunkLineWithMetadata(logger, line, &usage, &finishReason, &tools)
 		if err != nil {
-			return consumeResult{}, err
+			return failed(err)
 		}
 
 		chunk = thinkFilter.Feed(chunk)
@@ -286,7 +295,7 @@ func consumeStream(
 
 		if handler != nil {
 			if err := handler(ctx, chunk.Content); err != nil {
-				return consumeResult{}, err
+				return failed(err)
 			}
 		}
 		contentBuilder.WriteString(chunk.Content)
@@ -300,7 +309,7 @@ func consumeStream(
 	}
 
 	if err := scanner.Err(); err != nil {
-		return consumeResult{}, err
+		return failed(err)
 	}
 
 	content := strings.TrimSpace(contentBuilder.String())
