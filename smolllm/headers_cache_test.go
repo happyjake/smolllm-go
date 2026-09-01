@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -242,4 +243,149 @@ func TestWithoutStreamingIncompatibleOptions(t *testing.T) {
 		WithModel("openai/gpt-5"), WithBaseURL("http://127.0.0.1:1/"), WithAPIKey("k"),
 		WithoutStreaming())
 	require.ErrorContains(t, err, "Stream")
+}
+
+// A fallback chain reaches a different provider on each attempt, so a
+// provider-scoped header must never travel to the leg that follows it.
+func TestProviderHeadersDoNotLeakAcrossFallbackLegs(t *testing.T) {
+	// No t.Parallel: t.Setenv is incompatible with it.
+
+	var mu sync.Mutex
+	seen := map[string]http.Header{}
+	record := func(who string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			seen[who] = r.Header.Clone()
+			mu.Unlock()
+			if who == "first" {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		}
+	}
+	first := httptest.NewServer(record("first"))
+	defer first.Close()
+	second := httptest.NewServer(record("second"))
+	defer second.Close()
+
+	t.Setenv("ALPHA_BASE_URL", first.URL)
+	t.Setenv("ALPHA_API_KEY", "alpha-key")
+	t.Setenv("BETA_BASE_URL", second.URL)
+	t.Setenv("BETA_API_KEY", "beta-key")
+
+	_, err := Ask(context.Background(), PromptFromString("hi"),
+		WithModel("alpha/m,beta/m"),
+		WithProviderHeader("alpha", "X-Api-Key", "alpha-secret"),
+		WithHeader("X-Title", "shared"))
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Contains(t, seen, "first")
+	require.Contains(t, seen, "second")
+	assert.Equal(t, "alpha-secret", seen["first"].Get("X-Api-Key"))
+	assert.Empty(t, seen["second"].Get("X-Api-Key"),
+		"alpha's credential must not reach beta after fallback")
+	assert.Equal(t, "shared", seen["second"].Get("X-Title"), "unscoped headers still apply everywhere")
+}
+
+func TestWithHeaderRefusesCredentialLookingNames(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"X-Api-Key", "x-auth-token", "Cookie", "X-Secret"} {
+		assert.Panicsf(t, func() { WithHeader(name, "v") }, "%s should be refused globally", name)
+		assert.NotPanicsf(t, func() { WithProviderHeader("p", name, "v") }, "%s should be allowed scoped", name)
+	}
+}
+
+// Options is exported, so a custom Option can write ExtraHeaders directly and
+// never pass WithHeader's guard. The request builder must refuse reserved names
+// too, or Add would append a second Authorization beside the real one.
+func TestReservedHeadersRejectedAtRequestBuild(t *testing.T) {
+	t.Parallel()
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	sneaky := func(o *Options) {
+		o.ExtraHeaders = http.Header{}
+		o.ExtraHeaders.Set("Authorization", "Bearer stolen")
+		o.ExtraHeaders.Set("Content-Type", "text/plain")
+	}
+	_, err := Ask(context.Background(), PromptFromString("hi"),
+		WithModel("openai/gpt-5"), WithBaseURL(srv.URL+"/"), WithAPIKey("real"), sneaky)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"Bearer real"}, got.Values("Authorization"))
+	assert.Equal(t, []string{"application/json"}, got.Values("Content-Type"))
+}
+
+// An explicitly reported zero outranks a lower-priority dialect: the provider
+// said nothing came from cache, and reporting another field's number as fact
+// would be worse than reporting nothing.
+func TestCacheReadHonoursExplicitZero(t *testing.T) {
+	t.Parallel()
+	eighty := 80
+	u := usageChunk{
+		PromptTokensDetails: &struct {
+			CachedTokens int `json:"cached_tokens"`
+		}{CachedTokens: 0},
+		CacheReadInputTokens: &eighty,
+	}
+	assert.Equal(t, 0, u.cacheRead())
+	assert.True(t, u.reportedCache())
+
+	silent := usageChunk{PromptTokens: 10}
+	assert.Equal(t, 0, silent.cacheRead())
+	assert.False(t, silent.reportedCache(), "a provider that said nothing must not read as a reported zero")
+}
+
+// A blocking response carrying usage but no choices is an error, but its token
+// counts are real and must still reach the failure hook — the streaming path
+// records usage from a frame whose choices array is empty.
+func TestBlockingEmptyChoicesStillReportsUsage(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":0,"cache_read_input_tokens":80}}`))
+	}))
+	defer srv.Close()
+
+	var event RequestEvent
+	_, err := Ask(context.Background(), PromptFromString("hi"),
+		WithModel("openai/gpt-5"), WithBaseURL(srv.URL+"/"), WithAPIKey("k"),
+		WithoutStreaming(), WithHook(func(e RequestEvent) { event = e }))
+	require.Error(t, err)
+	assert.Equal(t, 100, event.InputTokens, "real prompt tokens must not be replaced by an estimate")
+	assert.Equal(t, 80, event.CacheReadTokens)
+	assert.False(t, event.Estimated)
+}
+
+// The extra-body merge decodes the whole payload, so it must not round integers
+// that no longer fit a float64 on their way to the provider.
+func TestExtraBodyMergePreservesLargeIntegers(t *testing.T) {
+	t.Parallel()
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	_, err := Ask(context.Background(), PromptFromString("hi"),
+		WithModel("openai/gpt-5"), WithBaseURL(srv.URL+"/"), WithAPIKey("k"),
+		WithSeed(9007199254740993),
+		WithExtraBody(map[string]any{"metadata": map[string]any{"k": "v"}}))
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "9007199254740993",
+		"seed was rounded through the extra-body merge")
 }

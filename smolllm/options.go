@@ -62,9 +62,14 @@ type Options struct {
 	// ExtraBody carries raw request fields the library does not model (e.g. tools,
 	// response_format). Merged into the payload last, so the caller wins.
 	ExtraBody map[string]any
-	// ExtraHeaders are added to every outbound provider request, after the
-	// library sets Content-Type and Authorization.
+	// ExtraHeaders are added to every outbound provider request of every leg,
+	// after the library sets Content-Type and Authorization. Only for headers
+	// that are safe to show every provider in a fallback chain.
 	ExtraHeaders http.Header
+	// ProviderHeaders are added only on legs served by the named provider, so a
+	// provider-specific credential never reaches a different provider when the
+	// chain falls through.
+	ProviderHeaders map[string]http.Header
 	// DisableStreaming makes Ask issue a plain stream:false request.
 	DisableStreaming bool
 }
@@ -325,6 +330,27 @@ func isReservedHeader(canonicalName string) bool {
 	return false
 }
 
+// credentialHeaderHints name headers that customarily carry a secret. They are
+// refused by WithHeader, which applies to every leg of a fallback chain: a
+// chain reaches a different provider on each attempt, so a credential set once
+// globally is sent to providers it does not belong to. WithProviderHeader is
+// the scoped form and accepts them.
+//
+// This is a denylist and therefore not exhaustive; it converts the common
+// mistake from a silent credential leak into a loud one at option-construction
+// time. WithProviderHeader remains the only correct home for any secret.
+var credentialHeaderHints = []string{"key", "token", "secret", "auth", "cookie", "credential", "password"}
+
+func looksLikeCredentialHeader(canonicalName string) bool {
+	lowered := strings.ToLower(canonicalName)
+	for _, hint := range credentialHeaderHints {
+		if strings.Contains(lowered, hint) {
+			return true
+		}
+	}
+	return false
+}
+
 // WithoutStreaming makes Ask perform a plain (stream:false) request instead of
 // streaming and reassembling.
 //
@@ -339,14 +365,15 @@ func WithoutStreaming() Option {
 	return func(o *Options) { o.DisableStreaming = true }
 }
 
-// WithHeader adds one header to every outbound provider request, including the
-// embeddings path and the stream_options-rejection retry. Repeated calls
-// accumulate; repeating a name adds a second value.
+// WithHeader adds one header to EVERY outbound provider request, on every leg
+// of a fallback chain, including the embeddings path and the
+// stream_options-rejection retry. Repeated calls accumulate.
 //
-// Panics on a reserved header (see reservedHeaders) — programmer error, matching
-// WithExtraBody's treatment of reserved body keys. The ${PROVIDER}_EXTRA_HEADERS
-// env form skips reserved names with a warning instead, since deployment config
-// should not crash a process.
+// Use it only for headers that every provider may see — attribution headers
+// such as X-Title or HTTP-Referer. It panics on a reserved header and on a name
+// that looks like it carries a secret, because WithModel("a/x,b/y") sends the
+// same global header to provider b after a falls through. Use
+// WithProviderHeader for anything provider-specific.
 func WithHeader(key, value string) Option {
 	canonical := http.CanonicalHeaderKey(strings.TrimSpace(key))
 	if canonical == "" {
@@ -355,11 +382,43 @@ func WithHeader(key, value string) Option {
 	if isReservedHeader(canonical) {
 		panic("WithHeader: may not set " + canonical)
 	}
+	if looksLikeCredentialHeader(canonical) {
+		panic("WithHeader: " + canonical + " looks like a credential and would be sent to every " +
+			"provider in a fallback chain; use WithProviderHeader(provider, ...) instead")
+	}
 	return func(o *Options) {
 		if o.ExtraHeaders == nil {
 			o.ExtraHeaders = http.Header{}
 		}
 		o.ExtraHeaders.Add(canonical, value)
+	}
+}
+
+// WithProviderHeader adds one header to requests served by the named provider
+// only, matching the provider segment of a model string ("openrouter" in
+// "openrouter/z-ai/glm-5.3"). This is the correct home for a provider-specific
+// credential such as x-api-key: a fallback chain reaches a different provider
+// on each attempt, and a scoped header never travels to the wrong one.
+func WithProviderHeader(providerName, key, value string) Option {
+	provider := strings.TrimSpace(providerName)
+	if provider == "" {
+		panic("WithProviderHeader: provider name must not be empty")
+	}
+	canonical := http.CanonicalHeaderKey(strings.TrimSpace(key))
+	if canonical == "" {
+		panic("WithProviderHeader: header name must not be empty")
+	}
+	if isReservedHeader(canonical) {
+		panic("WithProviderHeader: may not set " + canonical)
+	}
+	return func(o *Options) {
+		if o.ProviderHeaders == nil {
+			o.ProviderHeaders = map[string]http.Header{}
+		}
+		if o.ProviderHeaders[provider] == nil {
+			o.ProviderHeaders[provider] = http.Header{}
+		}
+		o.ProviderHeaders[provider].Add(canonical, value)
 	}
 }
 

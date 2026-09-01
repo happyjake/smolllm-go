@@ -39,9 +39,13 @@ type usageChunk struct {
 	PromptTokensDetails *struct {
 		CachedTokens int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"` // OpenAI, OpenRouter, z.ai, vLLM
-	PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`     // DeepSeek
-	CacheReadInputTokens     int `json:"cache_read_input_tokens"`     // Anthropic-style
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens"` // Anthropic-style
+	// Pointers, so an explicitly reported zero is distinguishable from an
+	// absent field. A provider that says cached_tokens:0 is asserting "nothing
+	// came from cache"; treating that as "unset" and falling through to a
+	// lower-priority dialect would report someone else's number as fact.
+	PromptCacheHitTokens     *int `json:"prompt_cache_hit_tokens"`     // DeepSeek
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`     // Anthropic-style
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"` // Anthropic-style
 }
 
 // cacheRead returns the prompt tokens served from cache, whichever dialect the
@@ -53,13 +57,33 @@ type usageChunk struct {
 // ordinary uncached input, not a billed cache write, and it is derivable as
 // InputTokens - CacheReadTokens.
 func (u *usageChunk) cacheRead() int {
-	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
+	if u.PromptTokensDetails != nil {
 		return u.PromptTokensDetails.CachedTokens
 	}
-	if u.PromptCacheHitTokens > 0 {
-		return u.PromptCacheHitTokens
+	if u.PromptCacheHitTokens != nil {
+		return *u.PromptCacheHitTokens
 	}
-	return u.CacheReadInputTokens
+	if u.CacheReadInputTokens != nil {
+		return *u.CacheReadInputTokens
+	}
+	return 0
+}
+
+// cacheWrite reports tokens written to cache. Only Anthropic-style endpoints
+// report writes at all.
+func (u *usageChunk) cacheWrite() int {
+	if u.CacheCreationInputTokens != nil {
+		return *u.CacheCreationInputTokens
+	}
+	return 0
+}
+
+// reportedCache reports whether the provider said anything at all about
+// caching. A consumer needs this to avoid averaging a known zero together with
+// an unknown, which yields a confidently wrong hit rate.
+func (u *usageChunk) reportedCache() bool {
+	return u.PromptTokensDetails != nil || u.PromptCacheHitTokens != nil ||
+		u.CacheReadInputTokens != nil || u.CacheCreationInputTokens != nil
 }
 
 type reportedUsage struct {
@@ -67,6 +91,7 @@ type reportedUsage struct {
 	outputTokens     int
 	cacheReadTokens  int
 	cacheWriteTokens int
+	cacheReported    bool
 	reported         bool
 }
 
@@ -167,12 +192,14 @@ func startStreamForwarder(
 			outputTokens := estimateTokens(combined)
 			cacheReadTokens := 0
 			cacheWriteTokens := 0
+			cacheReported := false
 			estimated := true
 			if usage.reported {
 				inputTokens = usage.inputTokens
 				outputTokens = usage.outputTokens
 				cacheReadTokens = usage.cacheReadTokens
 				cacheWriteTokens = usage.cacheWriteTokens
+				cacheReported = usage.cacheReported
 				estimated = false
 			}
 			completion.metrics = &streamMetrics{
@@ -181,6 +208,7 @@ func startStreamForwarder(
 				outputTokens:     outputTokens,
 				cacheReadTokens:  cacheReadTokens,
 				cacheWriteTokens: cacheWriteTokens,
+				cacheReported:    cacheReported,
 				total:            total,
 				ttft:             ttft,
 				estimated:        estimated,
@@ -310,7 +338,8 @@ func processChunkLineWithMetadata(
 		usage.inputTokens = chunk.Usage.PromptTokens
 		usage.outputTokens = chunk.Usage.CompletionTokens
 		usage.cacheReadTokens = chunk.Usage.cacheRead()
-		usage.cacheWriteTokens = chunk.Usage.CacheCreationInputTokens
+		usage.cacheWriteTokens = chunk.Usage.cacheWrite()
+		usage.cacheReported = chunk.Usage.reportedCache()
 		usage.reported = true
 	}
 	if finishReason != nil && len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != nil {

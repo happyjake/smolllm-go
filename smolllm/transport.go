@@ -84,7 +84,7 @@ func prepareLLMCall(prompt Prompt, opts Options, model string) (*preparedCall, e
 		ModelName:    modelName,
 		APIKey:       chosenKey,
 		InputTokens:  inputTokens,
-		ExtraHeaders: resolveExtraHeaders(prov, opts.ExtraHeaders, opts.Logger),
+		ExtraHeaders: resolveExtraHeaders(prov, opts.ExtraHeaders, opts.ProviderHeaders, opts.Logger),
 	}, nil
 }
 
@@ -157,9 +157,15 @@ func newProviderRequest(
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	// Reserved names are rejected when the option is built, so nothing here can
-	// displace the two headers above.
+	// Reserved names are revalidated here, not merely at option-construction
+	// time: Options is exported, so a custom Option can write ExtraHeaders
+	// directly and never pass through WithHeader's guard. Add would append a
+	// second Authorization rather than replace it, which is worse than either
+	// value alone.
 	for key, values := range extra {
+		if isReservedHeader(http.CanonicalHeaderKey(key)) {
+			continue
+		}
 		for _, value := range values {
 			req.Header.Add(key, value)
 		}
@@ -178,7 +184,9 @@ func newProviderRequest(
 // A reserved header in the env value is skipped with a warning rather than a
 // panic: crashing a deployment over its own configuration is hostile, whereas
 // the option form is programmer error and does panic.
-func resolveExtraHeaders(prov provider, explicit http.Header, logger *slog.Logger) http.Header {
+func resolveExtraHeaders(
+	prov provider, explicit http.Header, perProvider map[string]http.Header, logger *slog.Logger,
+) http.Header {
 	merged := http.Header{}
 	if prov.Name != "" {
 		for _, line := range strings.Split(os.Getenv(providerEnvKey(prov.Name, "EXTRA_HEADERS")), "\n") {
@@ -199,6 +207,14 @@ func resolveExtraHeaders(prov provider, explicit http.Header, logger *slog.Logge
 	}
 	for name, values := range explicit {
 		merged.Del(name) // explicit wins outright rather than appending to env
+		for _, value := range values {
+			merged.Add(name, value)
+		}
+	}
+	// Provider-scoped headers apply only on this leg, and outrank the global
+	// ones, so a chain never carries one provider's header to another.
+	for name, values := range perProvider[prov.Name] {
+		merged.Del(name)
 		for _, value := range values {
 			merged.Add(name, value)
 		}
@@ -321,12 +337,14 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 	outputTokens := 0
 	cacheReadTokens := 0
 	cacheWriteTokens := 0
+	cacheReported := false
 	estimated := true
 	if reported != nil && reported.reported {
 		inputTokens = reported.inputTokens
 		outputTokens = reported.outputTokens
 		cacheReadTokens = reported.cacheReadTokens
 		cacheWriteTokens = reported.cacheWriteTokens
+		cacheReported = reported.cacheReported
 		estimated = false
 	}
 	hook(RequestEvent{
@@ -339,6 +357,7 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 			OutputTokens:     outputTokens,
 			CacheReadTokens:  cacheReadTokens,
 			CacheWriteTokens: cacheWriteTokens,
+			CacheReported:    cacheReported,
 			Duration:         duration,
 			TTFT:             0,
 			Estimated:        estimated,

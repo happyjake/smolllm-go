@@ -168,6 +168,7 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		// Cache counts are provider-reported only; an estimated usage has none.
 		CacheReadTokens:  cr.usage.cacheReadTokens,
 		CacheWriteTokens: cr.usage.cacheWriteTokens,
+		CacheReported:    cr.usage.cacheReported,
 		Duration:         total,
 		TTFT:             cr.ttft,
 		Estimated:        estimated,

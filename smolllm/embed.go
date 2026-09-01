@@ -168,7 +168,7 @@ func embedOnce(ctx context.Context, input []string, opts Options, model string) 
 	defer cancel()
 
 	req, err := newProviderRequest(reqCtx, url, body, chosenKey,
-		resolveExtraHeaders(prov, opts.ExtraHeaders, opts.Logger))
+		resolveExtraHeaders(prov, opts.ExtraHeaders, opts.ProviderHeaders, opts.Logger))
 	if err != nil {
 		return fail(err, time.Time{})
 	}

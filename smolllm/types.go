@@ -214,10 +214,14 @@ type Usage struct {
 	// CacheWriteTokens is the provider-reported count of prompt tokens written
 	// to cache on this call. Only Anthropic-style endpoints report writes;
 	// elsewhere 0 means "not reported", not "nothing was cached".
-	CacheWriteTokens int           `json:"cache_write_tokens,omitempty"`
-	Duration         time.Duration `json:"duration"`
-	TTFT             time.Duration `json:"ttft"`
-	Estimated        bool          `json:"estimated"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	// CacheReported records whether the provider said anything about caching at
+	// all. Without it a zero is ambiguous, and averaging a reported zero with an
+	// unreported one produces a confidently wrong hit rate.
+	CacheReported bool          `json:"cache_reported,omitempty"`
+	Duration      time.Duration `json:"duration"`
+	TTFT          time.Duration `json:"ttft"`
+	Estimated     bool          `json:"estimated"`
 }
 
 // RequestEvent is emitted after each LLM call attempt (success or failure).
@@ -268,6 +272,7 @@ type streamMetrics struct {
 	outputTokens     int
 	cacheReadTokens  int
 	cacheWriteTokens int
+	cacheReported    bool
 	total            time.Duration
 	ttft             time.Duration
 	estimated        bool
@@ -319,6 +324,7 @@ func (s DeltaStream) Wait() error {
 			s.usage.OutputTokens = result.metrics.outputTokens
 			s.usage.CacheReadTokens = result.metrics.cacheReadTokens
 			s.usage.CacheWriteTokens = result.metrics.cacheWriteTokens
+			s.usage.CacheReported = result.metrics.cacheReported
 			s.usage.Duration = result.metrics.total
 			s.usage.TTFT = result.metrics.ttft
 			s.usage.Estimated = result.metrics.estimated

@@ -1,6 +1,7 @@
 package smolllm
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -159,8 +160,15 @@ func mergeExtraBody(body []byte, extra map[string]any) ([]byte, error) {
 	if len(extra) == 0 {
 		return body, nil
 	}
+	// UseNumber keeps integers exact. A plain unmarshal turns every number into
+	// a float64, so a value above 2^53 — a seed, a large id inside a restored
+	// message extra — is silently rounded on its way to the provider. The merge
+	// runs whenever any extra field is present, so this touches ordinary
+	// requests, not just exotic ones.
 	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
 		return nil, fmt.Errorf("decode request body for extra_body merge: %w", err)
 	}
 	for key, value := range extra {
