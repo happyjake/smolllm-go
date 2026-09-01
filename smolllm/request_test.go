@@ -17,7 +17,10 @@ func chatOptions(includeStreamUsage bool) chatPayloadOptions {
 		Stop:               nil,
 		Seed:               nil,
 		IncludeStreamUsage: includeStreamUsage,
-		ExtraBody:          nil,
+		// Streaming is what prepareLLMCall sets for every ordinary call; the
+		// blocking transport is opt-in and covered by its own tests.
+		Stream:    true,
+		ExtraBody: nil,
 	}
 }
 

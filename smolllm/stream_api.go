@@ -14,6 +14,9 @@ func Stream(ctx context.Context, prompt Prompt, opts ...Option) (*StreamResponse
 	}
 
 	options := applyOptions(opts...)
+	if options.DisableStreaming {
+		return nil, errors.New("WithoutStreaming is incompatible with Stream; use Ask")
+	}
 
 	selector, err := createSelector(options)
 	if err != nil {

@@ -30,15 +30,44 @@ type streamChunk struct {
 	Usage   *usageChunk    `json:"usage"`
 }
 
+// usageChunk decodes the provider's usage object. OpenAI-compatible endpoints
+// report prompt caching in three mutually-exclusive dialects, so all three are
+// decoded here and normalized by cacheRead.
 type usageChunk struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"` // OpenAI, OpenRouter, z.ai, vLLM
+	PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`     // DeepSeek
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`     // Anthropic-style
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"` // Anthropic-style
+}
+
+// cacheRead returns the prompt tokens served from cache, whichever dialect the
+// provider used. Precedence is fixed rather than "whichever is set", so a
+// provider that emits two of these (they carry the same number) decodes
+// deterministically.
+//
+// DeepSeek's prompt_cache_miss_tokens is deliberately not mapped: a miss is
+// ordinary uncached input, not a billed cache write, and it is derivable as
+// InputTokens - CacheReadTokens.
+func (u *usageChunk) cacheRead() int {
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
+		return u.PromptTokensDetails.CachedTokens
+	}
+	if u.PromptCacheHitTokens > 0 {
+		return u.PromptCacheHitTokens
+	}
+	return u.CacheReadInputTokens
 }
 
 type reportedUsage struct {
-	inputTokens  int
-	outputTokens int
-	reported     bool
+	inputTokens      int
+	outputTokens     int
+	cacheReadTokens  int
+	cacheWriteTokens int
+	reported         bool
 }
 
 func startStreamForwarder(
@@ -136,19 +165,25 @@ func startStreamForwarder(
 			combined := contentBuilder.String() + reasoningBuilder.String()
 			inputTokens := call.InputTokens
 			outputTokens := estimateTokens(combined)
+			cacheReadTokens := 0
+			cacheWriteTokens := 0
 			estimated := true
 			if usage.reported {
 				inputTokens = usage.inputTokens
 				outputTokens = usage.outputTokens
+				cacheReadTokens = usage.cacheReadTokens
+				cacheWriteTokens = usage.cacheWriteTokens
 				estimated = false
 			}
 			completion.metrics = &streamMetrics{
-				modelName:    call.ModelName,
-				inputTokens:  inputTokens,
-				outputTokens: outputTokens,
-				total:        total,
-				ttft:         ttft,
-				estimated:    estimated,
+				modelName:        call.ModelName,
+				inputTokens:      inputTokens,
+				outputTokens:     outputTokens,
+				cacheReadTokens:  cacheReadTokens,
+				cacheWriteTokens: cacheWriteTokens,
+				total:            total,
+				ttft:             ttft,
+				estimated:        estimated,
 			}
 		}
 
@@ -274,6 +309,8 @@ func processChunkLineWithMetadata(
 	if usage != nil && chunk.Usage != nil {
 		usage.inputTokens = chunk.Usage.PromptTokens
 		usage.outputTokens = chunk.Usage.CompletionTokens
+		usage.cacheReadTokens = chunk.Usage.cacheRead()
+		usage.cacheWriteTokens = chunk.Usage.CacheCreationInputTokens
 		usage.reported = true
 	}
 	if finishReason != nil && len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != nil {

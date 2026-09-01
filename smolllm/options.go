@@ -62,6 +62,11 @@ type Options struct {
 	// ExtraBody carries raw request fields the library does not model (e.g. tools,
 	// response_format). Merged into the payload last, so the caller wins.
 	ExtraBody map[string]any
+	// ExtraHeaders are added to every outbound provider request, after the
+	// library sets Content-Type and Authorization.
+	ExtraHeaders http.Header
+	// DisableStreaming makes Ask issue a plain stream:false request.
+	DisableStreaming bool
 }
 
 func defaultOptions() Options {
@@ -296,6 +301,67 @@ func WithMinOutputTokens(minTokens int) Option {
 // usage collection and routing all depend on them, so a caller override would
 // silently break them.
 var reservedExtraBodyKeys = []string{"stream", "stream_options", "messages", "model"}
+
+// reservedHeaders are set by the library itself on every provider request.
+//
+// Authorization is deliberately not overridable: the value is chosen per
+// attempt by the key balancer and per leg by the fallback chain, so a header
+// carried on Options would ride EVERY leg and send one provider's credential
+// to another. A provider needing a differently-named auth header (x-api-key,
+// api-key) adds it with WithHeader alongside Authorization; one needing a
+// different Authorization scheme needs real per-provider auth support, not an
+// override that silently defeats key rotation and makes APIKeyHint a lie.
+//
+// Content-Type is not overridable because the library encodes the body and it
+// is always JSON; overriding could only misdescribe the wire.
+var reservedHeaders = []string{"Authorization", "Content-Type"}
+
+func isReservedHeader(canonicalName string) bool {
+	for _, reserved := range reservedHeaders {
+		if canonicalName == reserved {
+			return true
+		}
+	}
+	return false
+}
+
+// WithoutStreaming makes Ask perform a plain (stream:false) request instead of
+// streaming and reassembling.
+//
+// Streaming remains the default: existing deployments depend on its timeout
+// behaviour through proxies that idle out a long blocking response, and both
+// WithStreamHandler and a meaningful TTFT only exist under streaming.
+//
+// Use it when a provider only reports — or only applies — prompt caching on
+// non-streaming requests. It is incompatible with WithStreamHandler and with
+// Stream(); both report an error rather than silently degrading.
+func WithoutStreaming() Option {
+	return func(o *Options) { o.DisableStreaming = true }
+}
+
+// WithHeader adds one header to every outbound provider request, including the
+// embeddings path and the stream_options-rejection retry. Repeated calls
+// accumulate; repeating a name adds a second value.
+//
+// Panics on a reserved header (see reservedHeaders) — programmer error, matching
+// WithExtraBody's treatment of reserved body keys. The ${PROVIDER}_EXTRA_HEADERS
+// env form skips reserved names with a warning instead, since deployment config
+// should not crash a process.
+func WithHeader(key, value string) Option {
+	canonical := http.CanonicalHeaderKey(strings.TrimSpace(key))
+	if canonical == "" {
+		panic("WithHeader: header name must not be empty")
+	}
+	if isReservedHeader(canonical) {
+		panic("WithHeader: may not set " + canonical)
+	}
+	return func(o *Options) {
+		if o.ExtraHeaders == nil {
+			o.ExtraHeaders = http.Header{}
+		}
+		o.ExtraHeaders.Add(canonical, value)
+	}
+}
 
 // WithExtraBody sets raw request fields the library does not model, merged into
 // the payload last so they win over library defaults. Panics when the caller sets

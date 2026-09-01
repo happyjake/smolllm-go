@@ -16,6 +16,11 @@ func Ask(ctx context.Context, prompt Prompt, opts ...Option) (*Response, error) 
 	}
 
 	options := applyOptions(opts...)
+	// Calling the handler once with the finished text would counterfeit the
+	// handler's contract, which is that it receives streamed deltas.
+	if options.DisableStreaming && options.StreamHandler != nil {
+		return nil, errors.New("WithoutStreaming is incompatible with WithStreamHandler")
+	}
 
 	selector, err := createSelector(options)
 	if err != nil {
@@ -81,7 +86,12 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		return fail(httpError(resp), nil)
 	}
 
-	cr, err := consumeStream(exec.requestContext(), opts.Logger, resp.Body, opts.StreamHandler, exec.start)
+	var cr consumeResult
+	if opts.DisableStreaming {
+		cr, err = consumeBlocking(resp.Body, exec.start)
+	} else {
+		cr, err = consumeStream(exec.requestContext(), opts.Logger, resp.Body, opts.StreamHandler, exec.start)
+	}
 	if err != nil {
 		return fail(err, &cr.usage)
 	}
@@ -129,6 +139,12 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 	}
 
 	total := time.Since(exec.start)
+	if opts.DisableStreaming {
+		// On a blocking transport the first usable token arrives with the last,
+		// so TTFT is the whole duration by definition. Pin them to the same
+		// measurement rather than two time.Since calls a microsecond apart.
+		cr.ttft = total
+	}
 	outputTokens := estimateTokens(content + cr.reasoning)
 	inputTokens := exec.call.InputTokens
 	estimated := true
@@ -149,9 +165,12 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		APIKeyHint:   previewAPIKey(exec.call.APIKey),
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
-		Duration:     total,
-		TTFT:         cr.ttft,
-		Estimated:    estimated,
+		// Cache counts are provider-reported only; an estimated usage has none.
+		CacheReadTokens:  cr.usage.cacheReadTokens,
+		CacheWriteTokens: cr.usage.cacheWriteTokens,
+		Duration:         total,
+		TTFT:             cr.ttft,
+		Estimated:        estimated,
 	}
 	if opts.Hook != nil {
 		opts.Hook(RequestEvent{Usage: usage, Error: nil, Timestamp: time.Now().UTC()})

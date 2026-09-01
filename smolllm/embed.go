@@ -1,7 +1,6 @@
 package smolllm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -168,12 +167,11 @@ func embedOnce(ctx context.Context, input []string, opts Options, model string) 
 	reqCtx, cancel := deriveContext(ctx, opts.Timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := newProviderRequest(reqCtx, url, body, chosenKey,
+		resolveExtraHeaders(prov, opts.ExtraHeaders, opts.Logger))
 	if err != nil {
 		return fail(err, time.Time{})
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+chosenKey)
 
 	opts.Logger.Info("sending embedding request",
 		"url", url,

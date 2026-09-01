@@ -42,7 +42,10 @@ type chatPayloadOptions struct {
 	Stop               []string
 	Seed               *int
 	IncludeStreamUsage bool
-	ExtraBody          map[string]any
+	// Stream selects the transport. Streaming is the default everywhere; a
+	// blocking request is opt-in via WithoutStreaming.
+	Stream    bool
+	ExtraBody map[string]any
 }
 
 var (
@@ -127,7 +130,7 @@ func buildRequestPayload(
 	payload := chatCompletionRequest{
 		Messages:        messages,
 		Model:           modelName,
-		Stream:          true,
+		Stream:          options.Stream,
 		StreamOptions:   streamOpts,
 		Temperature:     options.Temperature,
 		TopP:            options.TopP,

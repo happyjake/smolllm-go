@@ -21,6 +21,9 @@ type preparedCall struct {
 	ModelName   string
 	APIKey      string
 	InputTokens int
+	// ExtraHeaders is resolved per leg: a fallback chain reaches a different
+	// provider on each attempt, so headers must not be captured once globally.
+	ExtraHeaders http.Header
 }
 
 func prepareLLMCall(prompt Prompt, opts Options, model string) (*preparedCall, error) {
@@ -64,7 +67,8 @@ func prepareLLMCall(prompt Prompt, opts Options, model string) (*preparedCall, e
 			MaxTokens:          opts.MaxTokens,
 			Stop:               opts.Stop,
 			Seed:               opts.Seed,
-			IncludeStreamUsage: true,
+			Stream:             !opts.DisableStreaming,
+			IncludeStreamUsage: !opts.DisableStreaming,
 			ExtraBody:          opts.ExtraBody,
 		},
 	)
@@ -73,13 +77,14 @@ func prepareLLMCall(prompt Prompt, opts Options, model string) (*preparedCall, e
 	}
 
 	return &preparedCall{
-		URL:         url,
-		Body:        body,
-		Provider:    prov,
-		Model:       modelSpec,
-		ModelName:   modelName,
-		APIKey:      chosenKey,
-		InputTokens: inputTokens,
+		URL:          url,
+		Body:         body,
+		Provider:     prov,
+		Model:        modelSpec,
+		ModelName:    modelName,
+		APIKey:       chosenKey,
+		InputTokens:  inputTokens,
+		ExtraHeaders: resolveExtraHeaders(prov, opts.ExtraHeaders, opts.Logger),
 	}, nil
 }
 
@@ -134,6 +139,76 @@ func resolveAPIKey(prov provider, modelName, explicit string) (string, error) {
 	return "", fmt.Errorf("API key not found. set %s or provide WithAPIKey", envKey)
 }
 
+// newProviderRequest is the ONLY place an outbound provider request is built.
+// It owns Content-Type, Authorization, and the caller's extra headers.
+//
+// Every request path must go through it — the chat call, the
+// stream_options-rejection retry, and embeddings. Do not call
+// http.NewRequestWithContext for a provider call anywhere else: when headers
+// lived at each call site, the embeddings path silently never got them, and a
+// naive fix that patches the chat path alone still loses them on the retry,
+// which builds a brand-new request.
+func newProviderRequest(
+	ctx context.Context, url string, body []byte, apiKey string, extra http.Header,
+) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	// Reserved names are rejected when the option is built, so nothing here can
+	// displace the two headers above.
+	for key, values := range extra {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	return req, nil
+}
+
+// resolveExtraHeaders merges the per-provider env convention with the caller's
+// explicit headers, lowest precedence first, matching how base URL and API key
+// already resolve (explicit > env > builtin).
+//
+// ${PROVIDER}_EXTRA_HEADERS holds newline-separated "Name: Value" lines. Header
+// values legally contain commas and semicolons, so a newline is the only
+// delimiter that cannot collide with a real value.
+//
+// A reserved header in the env value is skipped with a warning rather than a
+// panic: crashing a deployment over its own configuration is hostile, whereas
+// the option form is programmer error and does panic.
+func resolveExtraHeaders(prov provider, explicit http.Header, logger *slog.Logger) http.Header {
+	merged := http.Header{}
+	if prov.Name != "" {
+		for _, line := range strings.Split(os.Getenv(providerEnvKey(prov.Name, "EXTRA_HEADERS")), "\n") {
+			name, value, ok := strings.Cut(line, ":")
+			name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+			if !ok || name == "" {
+				continue
+			}
+			if isReservedHeader(name) {
+				if logger != nil {
+					logger.Warn("ignoring reserved header from env",
+						"env", providerEnvKey(prov.Name, "EXTRA_HEADERS"), "header", name)
+				}
+				continue
+			}
+			merged.Add(name, strings.TrimSpace(value))
+		}
+	}
+	for name, values := range explicit {
+		merged.Del(name) // explicit wins outright rather than appending to env
+		for _, value := range values {
+			merged.Add(name, value)
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
 func providerEnvKey(providerName, suffix string) string {
 	base := strings.ToUpper(strings.ReplaceAll(providerName, "-", "_"))
 	return base + "_" + suffix
@@ -161,13 +236,11 @@ func newCallExecution(ctx context.Context, prompt Prompt, opts Options, model st
 
 	reqCtx, cancel := deriveContext(ctx, opts.Timeout)
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, call.URL, bytes.NewReader(call.Body))
+	req, err := newProviderRequest(reqCtx, call.URL, call.Body, call.APIKey, call.ExtraHeaders)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+call.APIKey)
 
 	return &callExecution{
 		call:   call,
@@ -217,12 +290,10 @@ func (c *callExecution) retryWithoutStreamUsage(resp *http.Response) (*http.Resp
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(originalBody))
 
-	req, err := http.NewRequestWithContext(c.req.Context(), http.MethodPost, c.call.URL, bytes.NewReader(body))
+	req, err := newProviderRequest(c.req.Context(), c.call.URL, body, c.call.APIKey, c.call.ExtraHeaders)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.call.APIKey)
 
 	c.call.Body = body
 	c.call.InputTokens = estimateTokens(string(body))
@@ -248,23 +319,29 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 	}
 	inputTokens := call.InputTokens
 	outputTokens := 0
+	cacheReadTokens := 0
+	cacheWriteTokens := 0
 	estimated := true
 	if reported != nil && reported.reported {
 		inputTokens = reported.inputTokens
 		outputTokens = reported.outputTokens
+		cacheReadTokens = reported.cacheReadTokens
+		cacheWriteTokens = reported.cacheWriteTokens
 		estimated = false
 	}
 	hook(RequestEvent{
 		Usage: Usage{
-			Provider:     call.Provider.Name,
-			Model:        call.Model,
-			ModelName:    call.ModelName,
-			APIKeyHint:   previewAPIKey(call.APIKey),
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
-			Duration:     duration,
-			TTFT:         0,
-			Estimated:    estimated,
+			Provider:         call.Provider.Name,
+			Model:            call.Model,
+			ModelName:        call.ModelName,
+			APIKeyHint:       previewAPIKey(call.APIKey),
+			InputTokens:      inputTokens,
+			OutputTokens:     outputTokens,
+			CacheReadTokens:  cacheReadTokens,
+			CacheWriteTokens: cacheWriteTokens,
+			Duration:         duration,
+			TTFT:             0,
+			Estimated:        estimated,
 		},
 		Error:     err,
 		Timestamp: time.Now().UTC(),

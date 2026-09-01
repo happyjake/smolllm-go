@@ -200,15 +200,24 @@ func (c StreamChunk) IsEmpty() bool { return c.Content == "" && c.Reasoning == "
 
 // Usage captures per-call metrics and routing details.
 type Usage struct {
-	Provider     string        `json:"provider"`
-	Model        string        `json:"model"`
-	ModelName    string        `json:"model_name"`
-	APIKeyHint   string        `json:"api_key_hint"`
-	InputTokens  int           `json:"input_tokens"`
-	OutputTokens int           `json:"output_tokens"`
-	Duration     time.Duration `json:"duration"`
-	TTFT         time.Duration `json:"ttft"`
-	Estimated    bool          `json:"estimated"`
+	Provider     string `json:"provider"`
+	Model        string `json:"model"`
+	ModelName    string `json:"model_name"`
+	APIKeyHint   string `json:"api_key_hint"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+	// CacheReadTokens is the provider-reported count of prompt tokens served
+	// from a prompt cache. Only ever provider-reported: it is 0 whenever
+	// Estimated is true, and 0 also means "the provider reported no cache
+	// data", which is indistinguishable from a genuine miss by design.
+	CacheReadTokens int `json:"cache_read_tokens,omitempty"`
+	// CacheWriteTokens is the provider-reported count of prompt tokens written
+	// to cache on this call. Only Anthropic-style endpoints report writes;
+	// elsewhere 0 means "not reported", not "nothing was cached".
+	CacheWriteTokens int           `json:"cache_write_tokens,omitempty"`
+	Duration         time.Duration `json:"duration"`
+	TTFT             time.Duration `json:"ttft"`
+	Estimated        bool          `json:"estimated"`
 }
 
 // RequestEvent is emitted after each LLM call attempt (success or failure).
@@ -254,12 +263,14 @@ type streamCompletion struct {
 }
 
 type streamMetrics struct {
-	modelName    string
-	inputTokens  int
-	outputTokens int
-	total        time.Duration
-	ttft         time.Duration
-	estimated    bool
+	modelName        string
+	inputTokens      int
+	outputTokens     int
+	cacheReadTokens  int
+	cacheWriteTokens int
+	total            time.Duration
+	ttft             time.Duration
+	estimated        bool
 }
 
 // Chan exposes the underlying channel of chunks.
@@ -306,6 +317,8 @@ func (s DeltaStream) Wait() error {
 		if s.usage != nil {
 			s.usage.InputTokens = result.metrics.inputTokens
 			s.usage.OutputTokens = result.metrics.outputTokens
+			s.usage.CacheReadTokens = result.metrics.cacheReadTokens
+			s.usage.CacheWriteTokens = result.metrics.cacheWriteTokens
 			s.usage.Duration = result.metrics.total
 			s.usage.TTFT = result.metrics.ttft
 			s.usage.Estimated = result.metrics.estimated
