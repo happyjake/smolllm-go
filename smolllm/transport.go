@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -237,6 +238,7 @@ type callExecution struct {
 	cancel context.CancelFunc
 	start  time.Time
 	logger *slog.Logger
+	hook   func(RequestEvent)
 }
 
 func newCallExecution(ctx context.Context, prompt Prompt, opts Options, model string) (*callExecution, error) {
@@ -265,6 +267,7 @@ func newCallExecution(ctx context.Context, prompt Prompt, opts Options, model st
 		cancel: cancel,
 		start:  time.Time{},
 		logger: opts.Logger,
+		hook:   opts.Hook,
 	}, nil
 }
 
@@ -311,6 +314,9 @@ func (c *callExecution) retryWithoutStreamUsage(resp *http.Response) (*http.Resp
 		return nil, false, err
 	}
 
+	// The rejected HTTP request is a distinct attempt, even if no usage was
+	// reported. Callers must not mistake the retry's credit for a complete total.
+	emitFailureHook(c.hook, c.call, &HTTPError{StatusCode: resp.StatusCode, Body: string(originalBody)}, c.start, nil)
 	c.call.Body = body
 	c.call.InputTokens = estimateTokens(string(body))
 	c.req = req
@@ -333,6 +339,17 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 	if !start.IsZero() {
 		duration = time.Since(start)
 	}
+	// Some providers report actual usage alongside an HTTP error. Preserve it
+	// just like usage arriving before a streaming failure, without interpreting it.
+	if reported == nil {
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) {
+			cr, _ := consumeBlocking(strings.NewReader(httpErr.Body), start)
+			if cr.usage.reported {
+				reported = &cr.usage
+			}
+		}
+	}
 	inputTokens := call.InputTokens
 	outputTokens := 0
 	cacheReadTokens := 0
@@ -351,6 +368,7 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 	}
 	hook(RequestEvent{
 		Usage: Usage{
+			RawUsage:           failureRawUsage(reported),
 			Provider:           call.Provider.Name,
 			Model:              call.Model,
 			ModelName:          call.ModelName,
@@ -368,6 +386,13 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 		Error:     err,
 		Timestamp: time.Now().UTC(),
 	})
+}
+
+func failureRawUsage(reported *reportedUsage) json.RawMessage {
+	if reported == nil {
+		return nil
+	}
+	return reported.rawUsage
 }
 
 func requestBodyWithoutStreamUsage(body []byte) ([]byte, bool, error) {

@@ -189,7 +189,10 @@ func TestAskHookFiresOnHTTPFailure(t *testing.T) {
 		}),
 	)
 	require.Error(t, err)
-	require.Len(t, events, 1)
+	// Initial stream_options rejection and compatibility retry are separate
+	// HTTP attempts, each of which must expose its (possibly unknown) usage.
+	require.Len(t, events, 2)
+	require.Error(t, events[1].Error)
 	require.Error(t, events[0].Error)
 	assert.Equal(t, "openai", events[0].Provider)
 	assert.Equal(t, "openai/gpt-5", events[0].Model)

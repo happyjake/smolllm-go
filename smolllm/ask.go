@@ -169,6 +169,7 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 	)
 
 	usage := Usage{
+		RawUsage:     cr.usage.rawUsage,
 		Provider:     exec.call.Provider.Name,
 		Model:        exec.call.Model,
 		ModelName:    exec.call.ModelName,

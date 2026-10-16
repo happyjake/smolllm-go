@@ -33,8 +33,9 @@ type streamChunk struct {
 // report prompt caching in three mutually-exclusive dialects, so all three are
 // decoded here and normalized by cacheRead.
 type usageChunk struct {
-	PromptTokens        int `json:"prompt_tokens"`
-	CompletionTokens    int `json:"completion_tokens"`
+	Raw                 json.RawMessage `json:"-"`
+	PromptTokens        int             `json:"prompt_tokens"`
+	CompletionTokens    int             `json:"completion_tokens"`
 	PromptTokensDetails *struct {
 		// Pointer: the details object also carries unrelated keys such as
 		// audio_tokens, so the object's presence does not mean the provider
@@ -48,6 +49,17 @@ type usageChunk struct {
 	PromptCacheHitTokens     *int `json:"prompt_cache_hit_tokens"`     // DeepSeek
 	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`     // Anthropic-style
 	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"` // Anthropic-style
+}
+
+func (u *usageChunk) UnmarshalJSON(data []byte) error {
+	type plain usageChunk
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = usageChunk(decoded)
+	u.Raw = append(json.RawMessage(nil), data...)
+	return nil
 }
 
 // cacheRead returns the prompt tokens served from cache, whichever dialect the
@@ -96,6 +108,7 @@ func (u *usageChunk) reportedCacheWrite() bool {
 }
 
 type reportedUsage struct {
+	rawUsage           json.RawMessage
 	inputTokens        int
 	outputTokens       int
 	cacheReadTokens    int
@@ -218,6 +231,7 @@ func startStreamForwarder(
 			estimated = false
 		}
 		completion.metrics = &streamMetrics{
+			rawUsage:           usage.rawUsage,
 			modelName:          call.ModelName,
 			inputTokens:        inputTokens,
 			outputTokens:       outputTokens,
@@ -359,6 +373,7 @@ func processChunkLineWithMetadata(
 	}
 
 	if usage != nil && chunk.Usage != nil {
+		usage.rawUsage = chunk.Usage.Raw
 		usage.inputTokens = chunk.Usage.PromptTokens
 		usage.outputTokens = chunk.Usage.CompletionTokens
 		usage.cacheReadTokens = chunk.Usage.cacheRead()

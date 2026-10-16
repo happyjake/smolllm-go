@@ -1,6 +1,7 @@
 package smolllm
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -200,12 +201,16 @@ func (c StreamChunk) IsEmpty() bool { return c.Content == "" && c.Reasoning == "
 
 // Usage captures per-call metrics and routing details.
 type Usage struct {
-	Provider     string `json:"provider"`
-	Model        string `json:"model"`
-	ModelName    string `json:"model_name"`
-	APIKeyHint   string `json:"api_key_hint"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
+	// RawUsage is the last provider usage snapshot, preserved verbatim for
+	// callers that consume vendor metadata (e.g. reported credit). The library
+	// does not interpret prices, currencies, or billing. Nil means unreported.
+	RawUsage     json.RawMessage `json:"-"`
+	Provider     string          `json:"provider"`
+	Model        string          `json:"model"`
+	ModelName    string          `json:"model_name"`
+	APIKeyHint   string          `json:"api_key_hint"`
+	InputTokens  int             `json:"input_tokens"`
+	OutputTokens int             `json:"output_tokens"`
 	// CacheReadTokens is the provider-reported count of prompt tokens served
 	// from a prompt cache. Only ever provider-reported: it is 0 whenever
 	// Estimated is true, and 0 also means "the provider reported no cache
@@ -270,6 +275,7 @@ type streamCompletion struct {
 }
 
 type streamMetrics struct {
+	rawUsage           json.RawMessage
 	modelName          string
 	inputTokens        int
 	outputTokens       int
@@ -342,6 +348,7 @@ func (s DeltaStream) absorb(result streamCompletion) {
 		)
 	}
 	if s.usage != nil {
+		s.usage.RawUsage = result.metrics.rawUsage
 		s.usage.InputTokens = result.metrics.inputTokens
 		s.usage.OutputTokens = result.metrics.outputTokens
 		s.usage.CacheReadTokens = result.metrics.cacheReadTokens
