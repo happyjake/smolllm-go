@@ -17,6 +17,13 @@ Canonical doctrine lives in the Python repo — read before proposing features:
 
 Domain glossary: [CONTEXT.md](CONTEXT.md).
 
+## Managed consumers
+
+**Dual-host maintenance:** runtime changes consumed by Pio/Jake-doom require the
+`pi-proxy-ops` maintenance runbook and running-version/tool gate before rollout
+completion. Rebuild both routers from the intended server/library revision pair;
+obtain separate approval for live service changes.
+
 ## Development
 
 - `make test` — `go test -v -race ./...` (offline: providers faked with `httptest`, no API keys needed)
