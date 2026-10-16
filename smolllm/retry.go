@@ -27,6 +27,14 @@ func isRetryableHTTPStatus(code int) bool {
 }
 
 func isRetryableError(err error) bool {
+	// An empty stream emitted nothing to the caller and, on the providers that
+	// behave this way, billed nothing (zero-usage terminal chunk), so a
+	// same-leg re-attempt is cheap against a failure mode that comes and goes
+	// between requests.
+	var empty *EmptyStreamError
+	if errors.As(err, &empty) {
+		return true
+	}
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) {
 		return isRetryableHTTPStatus(httpErr.StatusCode)
@@ -64,6 +72,9 @@ func withRetry[T any](ctx context.Context, logger *slog.Logger, model string, fn
 		}
 		result, err := fn()
 		if err == nil {
+			if attempt > 0 {
+				logger.Info("recovered after retry", "model", model, "attempt", attempt+1, "prev_err", lastErr)
+			}
 			return result, nil
 		}
 		lastErr = err

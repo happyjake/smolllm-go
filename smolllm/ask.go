@@ -93,6 +93,10 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		cr, err = consumeStream(exec.requestContext(), opts.Logger, resp.Body, opts.StreamHandler, exec.start)
 	}
 	if err != nil {
+		var empty *EmptyStreamError
+		if errors.As(err, &empty) && empty.Model == "" {
+			empty.Model = exec.call.Model
+		}
 		return fail(err, &cr.usage)
 	}
 
@@ -101,7 +105,13 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		content = stripBackticks(content)
 	}
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(cr.reasoning) == "" && len(cr.toolCalls) == 0 {
-		return fail(fmt.Errorf("model %q returned empty response", exec.call.Model), &cr.usage)
+		// Typed so withRetry treats it as transient: the provider emitted
+		// nothing usable, and this failure mode (see EmptyStreamError) comes and
+		// goes between identical requests. Same policy as the Stream gate.
+		return fail(&EmptyStreamError{
+			Model:        exec.call.Model,
+			FinishReason: cr.finishReason,
+		}, &cr.usage)
 	}
 
 	// Reasoning spent the whole output budget before any answer was emitted.

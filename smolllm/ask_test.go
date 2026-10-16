@@ -250,11 +250,15 @@ func TestAskFailureHookUsesReportedUsageWhenEmptyResponseFails(t *testing.T) {
 		}),
 	)
 	require.Error(t, err)
-	require.Len(t, events, 1)
-	require.Error(t, events[0].Error)
-	assert.Equal(t, 12, events[0].InputTokens)
-	assert.Equal(t, 0, events[0].OutputTokens)
-	assert.False(t, events[0].Estimated)
+	// Empty responses are transient (EmptyStreamError): every same-leg
+	// re-attempt reports its own failure with the provider-reported usage.
+	require.Len(t, events, defaultMaxRetries)
+	for _, event := range events {
+		require.Error(t, event.Error)
+		assert.Equal(t, 12, event.InputTokens)
+		assert.Equal(t, 0, event.OutputTokens)
+		assert.False(t, event.Estimated)
+	}
 }
 
 func TestAskResolvesBaseURLByPrecedence(t *testing.T) {

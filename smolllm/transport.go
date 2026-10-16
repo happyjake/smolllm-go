@@ -415,6 +415,31 @@ type HTTPError struct {
 	Body       string
 }
 
+// EmptyStreamError marks a leg whose stream ended before delivering any
+// usable assistant output — no content, no reasoning, no tool calls. The
+// doom/pi-proxy upstream does this on a fraction of gpt-6.1-sol calls: HTTP
+// 200, a single synthesized terminal chunk carrying finish_reason=error with
+// all-zero usage, then [DONE]. Nothing reached the caller and nothing was
+// billed, so the same leg is worth re-attempting before the chain moves on.
+type EmptyStreamError struct {
+	Model        string
+	FinishReason string
+	Err          error // underlying stream error when the stream did not end cleanly
+}
+
+func (e *EmptyStreamError) Error() string {
+	detail := ""
+	if e.FinishReason != "" {
+		detail = fmt.Sprintf(" (upstream finish_reason=%q)", e.FinishReason)
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("empty response: stream from model %q ended before any output%s: %v", e.Model, detail, e.Err)
+	}
+	return fmt.Sprintf("empty response: stream from model %q ended before any output%s", e.Model, detail)
+}
+
+func (e *EmptyStreamError) Unwrap() error { return e.Err }
+
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("http error %d: %s", e.StatusCode, e.Body)
 }

@@ -301,6 +301,22 @@ func (s DeltaStream) Wait() error {
 		return nil
 	}
 	result := <-s.done
+	s.absorb(result)
+	if s.hook != nil && s.usage != nil {
+		s.hook(RequestEvent{
+			Usage:     *s.usage,
+			Error:     result.err,
+			Timestamp: time.Now().UTC(),
+		})
+	}
+	return result.err
+}
+
+// absorb folds a stream's terminal state into the response fields: reasoning,
+// finish reason, tool calls, the metrics log line, and usage. Split out of
+// Wait so a caller that takes over the terminal state before the response is
+// handed to a consumer (see gateFirstOutput) runs the same bookkeeping.
+func (s DeltaStream) absorb(result streamCompletion) {
 	if s.reasoning != nil {
 		*s.reasoning = result.reasoning
 	}
@@ -310,39 +326,32 @@ func (s DeltaStream) Wait() error {
 	if s.toolCalls != nil {
 		*s.toolCalls = result.toolCalls
 	}
-	if result.metrics != nil {
-		if s.logger != nil {
-			s.logger.Info(
-				formatMetrics(
-					result.metrics.modelName,
-					result.metrics.inputTokens,
-					result.metrics.outputTokens,
-					result.metrics.total,
-					result.metrics.ttft,
-				),
-				"model", result.metrics.modelName,
-			)
-		}
-		if s.usage != nil {
-			s.usage.InputTokens = result.metrics.inputTokens
-			s.usage.OutputTokens = result.metrics.outputTokens
-			s.usage.CacheReadTokens = result.metrics.cacheReadTokens
-			s.usage.CacheWriteTokens = result.metrics.cacheWriteTokens
-			s.usage.CacheReadReported = result.metrics.cacheReadReported
-			s.usage.CacheWriteReported = result.metrics.cacheWriteReported
-			s.usage.Duration = result.metrics.total
-			s.usage.TTFT = result.metrics.ttft
-			s.usage.Estimated = result.metrics.estimated
-		}
+	if result.metrics == nil {
+		return
 	}
-	if s.hook != nil && s.usage != nil {
-		s.hook(RequestEvent{
-			Usage:     *s.usage,
-			Error:     result.err,
-			Timestamp: time.Now().UTC(),
-		})
+	if s.logger != nil {
+		s.logger.Info(
+			formatMetrics(
+				result.metrics.modelName,
+				result.metrics.inputTokens,
+				result.metrics.outputTokens,
+				result.metrics.total,
+				result.metrics.ttft,
+			),
+			"model", result.metrics.modelName,
+		)
 	}
-	return result.err
+	if s.usage != nil {
+		s.usage.InputTokens = result.metrics.inputTokens
+		s.usage.OutputTokens = result.metrics.outputTokens
+		s.usage.CacheReadTokens = result.metrics.cacheReadTokens
+		s.usage.CacheWriteTokens = result.metrics.cacheWriteTokens
+		s.usage.CacheReadReported = result.metrics.cacheReadReported
+		s.usage.CacheWriteReported = result.metrics.cacheWriteReported
+		s.usage.Duration = result.metrics.total
+		s.usage.TTFT = result.metrics.ttft
+		s.usage.Estimated = result.metrics.estimated
+	}
 }
 
 // StreamResponse wraps streaming metadata.

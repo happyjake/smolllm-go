@@ -323,7 +323,7 @@ func consumeStream(
 	// An assistant turn that only requests tool calls carries no text, but it is
 	// a complete, useful response.
 	if content == "" && reasoning == "" && len(toolCalls) == 0 {
-		return result, fmt.Errorf("empty response from model")
+		return result, &EmptyStreamError{FinishReason: finishReason}
 	}
 
 	return result, nil
