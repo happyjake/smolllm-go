@@ -117,7 +117,7 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		// The guard can also fire mid-body on a non-streaming call, in which case
 		// the transport reports a bare cancellation; attribute it before the
 		// generic handling below relabels an abandoned leg as a plain failure.
-		if guardErr := exec.firstOutputError("body"); guardErr != nil {
+		if guardErr := exec.firstOutputError("stream"); guardErr != nil {
 			return fail(guardErr, &cr.usage)
 		}
 		var empty *EmptyStreamError

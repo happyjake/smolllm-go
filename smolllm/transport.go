@@ -430,11 +430,16 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 			CacheReadReported:  cacheReadReported,
 			CacheWriteReported: cacheWriteReported,
 			Duration:           duration,
-			TTFT:               0,
-			Estimated:          estimated,
+			// A first-output timeout IS a TTFT measurement: the attempt waited
+			// this long and got nothing. Reporting 0 would make the one number
+			// operators want look like "answered instantly".
+			TTFT:      firstOutputWait(err),
+			Estimated: estimated,
 		},
-		Error:     err,
-		Timestamp: time.Now().UTC(),
+		Error:              err,
+		Timestamp:          time.Now().UTC(),
+		FirstOutputTimeout: isFirstOutputTimeout(err),
+		FirstOutputPhase:   firstOutputPhase(err),
 	})
 }
 
@@ -512,6 +517,11 @@ type FirstOutputTimeoutError struct {
 	// returned response headers yet, "stream" when headers arrived but no delta
 	// followed. A proxy that holds the connection open while queueing shows up
 	// as headers phase in the incident that motivated this check.
+	//
+	// There are exactly two phases, and both streaming and non-streaming calls
+	// use them: a non-streaming body that never completes is the same silence,
+	// so reporting it under a third name ("body") would split one phenomenon
+	// across two metric labels and hide the trend.
 	Phase string
 }
 
@@ -556,4 +566,33 @@ func httpError(resp *http.Response) error {
 		message = http.StatusText(resp.StatusCode)
 	}
 	return &HTTPError{StatusCode: resp.StatusCode, Body: message}
+}
+
+// isFirstOutputTimeout reports whether err means "this leg produced nothing in
+// time" rather than "this leg is broken". The distinction matters downstream:
+// a queued leg must not be counted against the model's health.
+func isFirstOutputTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var target *FirstOutputTimeoutError
+	return errors.As(err, &target)
+}
+
+func firstOutputPhase(err error) string {
+	phase, ok := IsFirstOutputTimeout(err)
+	if !ok {
+		return ""
+	}
+	return phase
+}
+
+// firstOutputWait exposes how long a timed-out attempt waited, so the hook can
+// record it as TTFT instead of the zero that means "answered instantly".
+func firstOutputWait(err error) time.Duration {
+	var target *FirstOutputTimeoutError
+	if errors.As(err, &target) {
+		return target.Elapsed
+	}
+	return 0
 }

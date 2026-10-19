@@ -237,6 +237,26 @@ type RequestEvent struct {
 	Usage
 	Error     error     `json:"-"`
 	Timestamp time.Time `json:"timestamp"`
+	// FirstOutputTimeout is true when this attempt was abandoned because the
+	// model produced nothing within FirstOutputTimeout. Such an attempt says
+	// nothing about the model's health: it says the leg was queued. Counting it
+	// as a model failure would blame the model for the queue.
+	FirstOutputTimeout bool `json:"first_output_timeout,omitempty"`
+	// FirstOutputPhase names where the wait happened for a first-output timeout
+	// ("headers" or "stream"), and is empty otherwise. Operators need it to tell
+	// a silent upstream from a proxy that accepted the connection and stalled.
+	FirstOutputPhase string `json:"first_output_phase,omitempty"`
+}
+
+// IsFirstOutputTimeout reports whether err is a first-output timeout, and
+// returns its phase when it is. Callers use this to separate "queued" from
+// "broken" without matching on message text.
+func IsFirstOutputTimeout(err error) (phase string, ok bool) {
+	var target *FirstOutputTimeoutError
+	if errors.As(err, &target) {
+		return target.Phase, true
+	}
+	return "", false
 }
 
 // Response holds a full LLM response.
