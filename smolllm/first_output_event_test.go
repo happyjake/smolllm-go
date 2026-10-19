@@ -105,3 +105,41 @@ func TestIsFirstOutputTimeoutSeesThroughWrapping(t *testing.T) {
 	_, ok = IsFirstOutputTimeout(nil)
 	assert.False(t, ok, "nil must not be a timeout")
 }
+
+// The streaming path must report a first-output timeout the same way the
+// blocking path does. It did not: gateFirstOutput returned the guard's verdict
+// bare, so a streamed leg abandoned for silence produced no RequestEvent at
+// all and vanished from the ledger -- which is precisely the metric that
+// distinguishes "queued upstream" from "model is broken". Found live: the same
+// silent upstream recorded one attempt via Ask and zero via Stream.
+func TestStreamedFirstOutputTimeoutIsReportedToTheHook(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int32
+	srv := silentLeg(t, &hits)
+	events, hook := collectEvents()
+
+	st, err := Stream(context.Background(), PromptFromString("hi"),
+		WithModel("openai/model-a"),
+		WithBaseURL(srv.URL+"/"),
+		WithAPIKey("test-key"),
+		WithFirstOutputTimeout(150*time.Millisecond),
+		WithTimeout(10*time.Second),
+		hook,
+	)
+	if err == nil {
+		// The guard may surface through Wait instead; either surface counts,
+		// but exactly one event must exist.
+		err = st.Stream.Wait()
+	}
+	require.Error(t, err)
+
+	require.Len(t, *events, 1,
+		"a streamed first-output timeout must produce exactly one attempt event")
+	e := (*events)[0]
+	assert.True(t, e.FirstOutputTimeout, "event.FirstOutputTimeout = false, want true")
+	assert.Equal(t, "stream", e.FirstOutputPhase)
+	assert.GreaterOrEqual(t, e.TTFT, 100*time.Millisecond,
+		"TTFT should reflect the wait, got %v", e.TTFT)
+	assert.Error(t, e.Error)
+}

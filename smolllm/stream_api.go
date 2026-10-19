@@ -166,7 +166,7 @@ func gateFirstOutput(exec *callExecution, opts Options, sr *StreamResponse) erro
 		if !exec.disarmFirstOutput() {
 			exec.cancel()
 			s.absorb(<-s.done)
-			return exec.firstOutputError("stream")
+			return reportAbandonedLeg(opts.Hook, exec, "stream")
 		}
 		replay := make(chan StreamChunk, 1)
 		replay <- first
@@ -198,7 +198,7 @@ func gateFirstOutput(exec *callExecution, opts Options, sr *StreamResponse) erro
 	// verdict so the chain's logs and metrics separate queueing from failures.
 	if guardErr := exec.firstOutputError("stream"); guardErr != nil {
 		exec.cancel()
-		return guardErr
+		return reportAbandonedLeg(opts.Hook, exec, "stream")
 	}
 	// Context failures are not transient emptiness — re-attempting them would
 	// replay the same timeout against the same dead leg.
@@ -252,4 +252,23 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// reportAbandonedLeg records a stream leg the first-output guard wrote off, and
+// returns the guard's verdict.
+//
+// The gate runs after the stream is established, so nothing downstream will
+// emit a hook for it: without this the attempt leaves no trace in the ledger
+// and a streamed first-output timeout reads as a request that never happened —
+// the one outcome that separates "queued upstream" from "model is broken".
+// Scoped to the guard's own verdict on purpose. An empty stream also fails the
+// gate, but it already reports itself, and hooking it here too would double
+// count every dead-on-arrival leg.
+func reportAbandonedLeg(hook func(RequestEvent), exec *callExecution, phase string) error {
+	guardErr := exec.firstOutputError(phase)
+	if guardErr == nil {
+		return nil
+	}
+	emitFailureHook(hook, exec.call, guardErr, exec.start, nil)
+	return guardErr
 }
