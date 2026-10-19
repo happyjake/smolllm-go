@@ -35,6 +35,14 @@ func Stream(ctx context.Context, prompt Prompt, opts ...Option) (*StreamResponse
 		})
 		if err != nil {
 			lastErr = err
+			// A dead caller context is not a per-model failure: every remaining
+			// leg would dial with a cancelled context, fail in microseconds and
+			// log a fallback warning that never represented a real attempt.
+			// Stop here so the cancellation surfaces as itself.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				options.Logger.Warn("aborting fallback chain: caller context is done", "model", model, "error", ctxErr.Error())
+				return nil, ctxErr
+			}
 			if selector.HasMore() {
 				options.Logger.Warn("model failed, trying fallback", "model", model, "error", err.Error())
 			} else {
