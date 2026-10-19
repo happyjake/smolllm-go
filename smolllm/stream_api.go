@@ -132,6 +132,7 @@ func streamOnce(ctx context.Context, prompt Prompt, opts Options, model string) 
 		toolCalls:    &sr.ToolCalls,
 		usage:        &sr.Usage,
 		hook:         opts.Hook,
+		streaming:    exec.call.Streaming,
 	}
 	if err := gateFirstOutput(exec, opts, sr); err != nil {
 		return nil, err

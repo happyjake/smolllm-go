@@ -22,6 +22,10 @@ type preparedCall struct {
 	ModelName   string
 	APIKey      string
 	InputTokens int
+	// Streaming records the transport mode chosen for this call. It is stamped
+	// once here, from the same expression that sets the request's stream flag,
+	// so the event that reports it can never drift from what was actually sent.
+	Streaming bool
 	// ExtraHeaders is resolved per leg: a fallback chain reaches a different
 	// provider on each attempt, so headers must not be captured once globally.
 	ExtraHeaders http.Header
@@ -85,6 +89,7 @@ func prepareLLMCall(prompt Prompt, opts Options, model string) (*preparedCall, e
 		ModelName:    modelName,
 		APIKey:       chosenKey,
 		InputTokens:  inputTokens,
+		Streaming:    !opts.DisableStreaming,
 		ExtraHeaders: resolveExtraHeaders(prov, opts.ExtraHeaders, opts.ProviderHeaders, opts.Logger),
 	}, nil
 }
@@ -440,6 +445,7 @@ func emitFailureHook(hook func(RequestEvent), call *preparedCall, err error, sta
 		Timestamp:          time.Now().UTC(),
 		FirstOutputTimeout: isFirstOutputTimeout(err),
 		FirstOutputPhase:   firstOutputPhase(err),
+		Streaming:          call.Streaming,
 	})
 }
 

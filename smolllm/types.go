@@ -246,6 +246,13 @@ type RequestEvent struct {
 	// ("headers" or "stream"), and is empty otherwise. Operators need it to tell
 	// a silent upstream from a proxy that accepted the connection and stalled.
 	FirstOutputPhase string `json:"first_output_phase,omitempty"`
+	// Streaming reports whether this attempt used the streaming transport. It is
+	// set from the upstream call mode, not from the caller's request flag, so a
+	// non-streaming attempt cannot be mislabelled as streaming. The distinction
+	// matters downstream: a streaming attempt's TTFT is time-to-first-byte while
+	// a blocking attempt's TTFT is the whole duration, and mixing the two in one
+	// distribution makes the latency signal describe neither.
+	Streaming bool `json:"streaming,omitempty"`
 }
 
 // IsFirstOutputTimeout reports whether err is a first-output timeout, and
@@ -284,6 +291,9 @@ type DeltaStream struct {
 	toolCalls    *[]ToolCall
 	usage        *Usage
 	hook         func(RequestEvent)
+	// streaming mirrors the upstream call mode so the terminal event can report
+	// it without inferring it from timing.
+	streaming bool
 }
 
 type streamCompletion struct {
@@ -333,6 +343,7 @@ func (s DeltaStream) Wait() error {
 			Usage:     *s.usage,
 			Error:     result.err,
 			Timestamp: time.Now().UTC(),
+			Streaming: s.streaming,
 		})
 	}
 	return result.err

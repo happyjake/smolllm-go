@@ -213,7 +213,7 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 		Estimated:          estimated,
 	}
 	if opts.Hook != nil {
-		opts.Hook(RequestEvent{Usage: usage, Error: nil, Timestamp: time.Now().UTC()})
+		opts.Hook(RequestEvent{Usage: usage, Error: nil, Timestamp: time.Now().UTC(), Streaming: exec.call.Streaming})
 	}
 
 	return &Response{
