@@ -74,6 +74,10 @@ func streamOnce(ctx context.Context, prompt Prompt, opts Options, model string) 
 
 	resp, err := exec.do("starting stream")
 	if err != nil {
+		if guardErr := exec.firstOutputError("headers"); guardErr != nil {
+			exec.cancel()
+			return nil, guardErr
+		}
 		exec.cancel()
 		return fail(err)
 	}
@@ -155,6 +159,14 @@ func gateFirstOutput(exec *callExecution, opts Options, sr *StreamResponse) erro
 	s := &sr.Stream
 	first, ok := <-s.ch
 	if ok {
+		// A delta arrived, so this leg has proven it will deliver: stop the
+		// first-output guard before anything is forwarded. If it already fired
+		// the leg was abandoned mid-wait and this chunk must not leak out.
+		if !exec.disarmFirstOutput() {
+			exec.cancel()
+			s.absorb(<-s.done)
+			return exec.firstOutputError("stream")
+		}
 		replay := make(chan StreamChunk, 1)
 		replay <- first
 		// A dedicated stop signal, not the request context: the forwarder
@@ -181,6 +193,12 @@ func gateFirstOutput(exec *callExecution, opts Options, sr *StreamResponse) erro
 		return nil
 	}
 	s.absorb(result)
+	// A leg abandoned for silence is not merely empty: report the guard's own
+	// verdict so the chain's logs and metrics separate queueing from failures.
+	if guardErr := exec.firstOutputError("stream"); guardErr != nil {
+		exec.cancel()
+		return guardErr
+	}
 	// Context failures are not transient emptiness — re-attempting them would
 	// replay the same timeout against the same dead leg.
 	if result.err != nil && (errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded)) {

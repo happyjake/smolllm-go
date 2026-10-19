@@ -266,6 +266,7 @@ func consumeStream(
 	reader io.Reader,
 	handler func(context.Context, string) error,
 	start time.Time,
+	onFirstOutput func() error,
 ) (consumeResult, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
@@ -305,6 +306,14 @@ func consumeStream(
 
 		if firstToken.IsZero() {
 			firstToken = time.Now().UTC()
+			// The leg has proven it delivers: stop any first-output guard before
+			// the delta is consumed. Failing here means the guard already fired and
+			// this output must not be attributed to the caller.
+			if onFirstOutput != nil {
+				if err := onFirstOutput(); err != nil {
+					return failed(err)
+				}
+			}
 		}
 
 		if handler != nil {

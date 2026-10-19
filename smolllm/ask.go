@@ -75,6 +75,9 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 
 	resp, err := exec.do("sending request")
 	if err != nil {
+		if guardErr := exec.firstOutputError("headers"); guardErr != nil {
+			return fail(guardErr, nil)
+		}
 		return fail(err, nil)
 	}
 	defer func(resp *http.Response) { _ = resp.Body.Close() }(resp)
@@ -96,11 +99,27 @@ func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*R
 
 	var cr consumeResult
 	if opts.DisableStreaming {
+		// A non-streaming response carries no deltas: the complete body is the
+		// first output, so the guard has nothing left to bound once headers have
+		// arrived and must be disarmed or it would truncate a real answer.
+		exec.disarmFirstOutput()
 		cr, err = consumeBlocking(resp.Body, exec.start)
 	} else {
-		cr, err = consumeStream(exec.requestContext(), opts.Logger, resp.Body, opts.StreamHandler, exec.start)
+		cr, err = consumeStream(exec.requestContext(), opts.Logger, resp.Body, opts.StreamHandler, exec.start,
+			func() error {
+				if exec.disarmFirstOutput() {
+					return nil
+				}
+				return exec.firstOutputError("stream")
+			})
 	}
 	if err != nil {
+		// The guard can also fire mid-body on a non-streaming call, in which case
+		// the transport reports a bare cancellation; attribute it before the
+		// generic handling below relabels an abandoned leg as a plain failure.
+		if guardErr := exec.firstOutputError("body"); guardErr != nil {
+			return fail(guardErr, &cr.usage)
+		}
 		var empty *EmptyStreamError
 		if errors.As(err, &empty) && empty.Model == "" {
 			empty.Model = exec.call.Model

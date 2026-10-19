@@ -239,6 +239,14 @@ type callExecution struct {
 	start  time.Time
 	logger *slog.Logger
 	hook   func(RequestEvent)
+
+	// attemptCtx is the per-attempt context, cancelled by cancel.
+	attemptCtx context.Context
+	// firstOutputTimer fires when no delta has arrived in time. Nil when the
+	// check is disabled.
+	firstOutputTimer  *time.Timer
+	firstOutputBudget time.Duration
+	startedAt         time.Time
 }
 
 func newCallExecution(ctx context.Context, prompt Prompt, opts Options, model string) (*callExecution, error) {
@@ -252,23 +260,65 @@ func newCallExecution(ctx context.Context, prompt Prompt, opts Options, model st
 		client = http.DefaultClient
 	}
 
-	reqCtx, cancel := deriveContext(ctx, opts.Timeout)
+	attemptCtx, cancel := deriveContext(ctx, opts.Timeout)
+	// A cancel-with-cause lets the first-output guard stop the wait without
+	// disturbing an attempt that is already streaming, which a plain deadline
+	// context could not do.
+	reqCtx, cancelCause := context.WithCancelCause(attemptCtx)
 
 	req, err := newProviderRequest(reqCtx, call.URL, call.Body, call.APIKey, call.ExtraHeaders)
 	if err != nil {
+		cancelCause(nil)
 		cancel()
 		return nil, err
 	}
 
-	return &callExecution{
-		call:   call,
-		client: client,
-		req:    req,
-		cancel: cancel,
-		start:  time.Time{},
-		logger: opts.Logger,
-		hook:   opts.Hook,
-	}, nil
+	exec := &callExecution{
+		call:       call,
+		client:     client,
+		req:        req,
+		cancel:     func() { cancelCause(nil); cancel() },
+		start:      time.Time{},
+		logger:     opts.Logger,
+		hook:       opts.Hook,
+		attemptCtx: attemptCtx,
+	}
+
+	if budget := opts.FirstOutputTimeout; budget > 0 {
+		exec.firstOutputBudget = budget
+		exec.startedAt = time.Now()
+		exec.firstOutputTimer = time.AfterFunc(budget, func() {
+			cancelCause(ErrFirstOutputTimeout)
+		})
+	}
+
+	return exec, nil
+}
+
+// disarmFirstOutput stops the first-output guard once a leg has proven it will
+// deliver. Reports false when the timer already fired, in which case the leg
+// must be treated as abandoned and nothing may be forwarded.
+func (c *callExecution) disarmFirstOutput() bool {
+	if c.firstOutputTimer == nil {
+		return true
+	}
+	return c.firstOutputTimer.Stop()
+}
+
+// firstOutputError reports the guard's verdict for err, or nil when the guard
+// did not fire. Callers check the attempt context's cause rather than the
+// error itself: the HTTP client reports its own cancellation as
+// context.Canceled, which is indistinguishable from a caller hang-up.
+func (c *callExecution) firstOutputError(phase string) error {
+	if !errors.Is(context.Cause(c.req.Context()), ErrFirstOutputTimeout) {
+		return nil
+	}
+	return &FirstOutputTimeoutError{
+		Model:   c.call.Model,
+		Budget:  c.firstOutputBudget,
+		Elapsed: time.Since(c.startedAt),
+		Phase:   phase,
+	}
 }
 
 func (c *callExecution) do(event string) (*http.Response, error) {
@@ -446,6 +496,33 @@ type HTTPError struct {
 // 200, a single synthesized terminal chunk carrying finish_reason=error with
 // all-zero usage, then [DONE]. Nothing reached the caller and nothing was
 // billed, so the same leg is worth re-attempting before the chain moves on.
+// ErrFirstOutputTimeout reports that a leg produced no content or reasoning
+// delta within Options.FirstOutputTimeout, so the chain abandoned it. It is
+// deliberately not retryable: the leg is merely queueing upstream, and a
+// same-leg retry would spend the budget again to learn the same thing.
+var ErrFirstOutputTimeout = errors.New("smolllm: no output before first-output timeout")
+
+// FirstOutputTimeoutError carries which leg was abandoned and how long it had
+// been waiting, so logs and metrics can separate queueing from real failures.
+type FirstOutputTimeoutError struct {
+	Model   string
+	Budget  time.Duration
+	Elapsed time.Duration
+	// Phase records where the wait happened: "headers" when the upstream had not
+	// returned response headers yet, "stream" when headers arrived but no delta
+	// followed. A proxy that holds the connection open while queueing shows up
+	// as headers phase in the incident that motivated this check.
+	Phase string
+}
+
+func (e *FirstOutputTimeoutError) Error() string {
+	return fmt.Sprintf("no output from model %q within %s (waited %s, phase=%s)",
+		e.Model, e.Budget, e.Elapsed.Round(time.Millisecond), e.Phase)
+}
+
+// Is makes errors.Is(err, ErrFirstOutputTimeout) work through wrap chains.
+func (e *FirstOutputTimeoutError) Is(target error) bool { return target == ErrFirstOutputTimeout }
+
 type EmptyStreamError struct {
 	Model        string
 	FinishReason string

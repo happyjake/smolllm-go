@@ -39,8 +39,18 @@ type Options struct {
 	BaseURL string
 	// ImagePaths embeds local files or data URLs into the first user message.
 	ImagePaths []string
-	// Timeout bounds the total duration including retries.
+	// Timeout bounds one upstream attempt, not the whole chain: each fallback
+	// leg gets its own budget, so the worst case is legs x retries x Timeout.
+	// A caller that needs an overall bound must impose it on the context.
 	Timeout time.Duration
+	// FirstOutputTimeout bounds how long one leg may take to produce its first
+	// content or reasoning delta. A leg that exceeds it is abandoned and the
+	// chain advances, which is what a merely-slow provider needs: Timeout alone
+	// would let such a leg consume the whole budget and never fall back. It
+	// guards only the first output — once deltas flow, the bytes cannot be
+	// retracted, so a mid-stream stall is bounded by Timeout instead.
+	// Zero disables the check.
+	FirstOutputTimeout time.Duration
 	// RemoveBackticks toggles best-effort markdown fence stripping post-response.
 	RemoveBackticks bool
 	// StreamHandler receives streamed deltas when streaming is enabled.
@@ -89,6 +99,7 @@ func defaultOptions() Options {
 		BaseURL:         "",
 		ImagePaths:      nil,
 		Timeout:         600 * time.Second,
+		FirstOutputTimeout: defaultFirstOutputTimeout,
 		RemoveBackticks: false,
 		StreamHandler:   nil,
 		HTTPClient:      nil,
@@ -248,10 +259,20 @@ func WithImagePaths(paths ...string) Option {
 	}
 }
 
-// WithTimeout defines the hard timeout for the request.
+// WithTimeout defines the hard timeout for one upstream attempt.
 func WithTimeout(timeout time.Duration) Option {
 	return func(o *Options) {
 		o.Timeout = timeout
+	}
+}
+
+// WithFirstOutputTimeout bounds how long a leg may wait for its first content
+// or reasoning delta before the chain abandons it and tries the next one. A
+// non-positive value disables the check. Defaults to
+// defaultFirstOutputTimeout.
+func WithFirstOutputTimeout(timeout time.Duration) Option {
+	return func(o *Options) {
+		o.FirstOutputTimeout = timeout
 	}
 }
 
