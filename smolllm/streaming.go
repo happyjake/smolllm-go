@@ -159,9 +159,19 @@ func startStreamForwarder(
 
 			line := scanner.Text()
 			var chunk StreamChunk
-			chunk, err = processChunkLineWithMetadata(logger, line, &usage, &finishReason, &tools)
+			var toolEvidence bool
+			chunk, toolEvidence, err = processChunkLineWithMetadata(logger, line, &usage, &finishReason, &tools)
 			if err != nil {
 				break
+			}
+
+			if toolEvidence && firstToken.IsZero() {
+				// A tool-call fragment is generation evidence even though it never
+				// becomes a chunk: the upstream is producing the answer, and the
+				// caller cannot act until it lands either. Marking it here - above
+				// the IsEmpty skip - is what stops a slow argument stream from
+				// looking silent and being abandoned as a first-output timeout.
+				firstToken = time.Now().UTC()
 			}
 
 			chunk = thinkFilter.Feed(chunk)
@@ -294,9 +304,22 @@ func consumeStream(
 		}
 
 		line := scanner.Text()
-		chunk, err := processChunkLineWithMetadata(logger, line, &usage, &finishReason, &tools)
+		var toolEvidence bool
+		chunk, toolEvidence, err := processChunkLineWithMetadata(logger, line, &usage, &finishReason, &tools)
 		if err != nil {
 			return failed(err)
+		}
+
+		if toolEvidence && firstToken.IsZero() {
+			// A tool-call fragment never becomes a chunk, but the upstream is
+			// generating: mark it and disarm the guard here, before the IsEmpty
+			// skip, or a slow argument stream looks silent and gets abandoned.
+			firstToken = time.Now().UTC()
+			if onFirstOutput != nil {
+				if err := onFirstOutput(); err != nil {
+					return failed(err)
+				}
+			}
 		}
 
 		chunk = thinkFilter.Feed(chunk)
@@ -353,7 +376,8 @@ func consumeStream(
 }
 
 func processChunkLine(logger *slog.Logger, line string) (StreamChunk, error) {
-	return processChunkLineWithMetadata(logger, line, nil, nil, nil)
+	chunk, _, err := processChunkLineWithMetadata(logger, line, nil, nil, nil)
+	return chunk, err
 }
 
 func processChunkLineWithMetadata(
@@ -362,23 +386,23 @@ func processChunkLineWithMetadata(
 	usage *reportedUsage,
 	finishReason *string,
 	tools *toolCallAccumulator,
-) (StreamChunk, error) {
+) (StreamChunk, bool, error) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" || trimmed == "data: [DONE]" {
-		return StreamChunk{Content: "", Reasoning: ""}, nil
+		return StreamChunk{Content: "", Reasoning: ""}, false, nil
 	}
 	if !strings.HasPrefix(trimmed, "data:") {
-		return StreamChunk{Content: "", Reasoning: ""}, nil
+		return StreamChunk{Content: "", Reasoning: ""}, false, nil
 	}
 	payload := strings.TrimSpace(trimmed[len("data:"):])
 	if payload == "" {
-		return StreamChunk{Content: "", Reasoning: ""}, nil
+		return StreamChunk{Content: "", Reasoning: ""}, false, nil
 	}
 
 	var chunk streamChunk
 	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 		logger.Error("malformed streaming chunk", "error", err)
-		return StreamChunk{Content: "", Reasoning: ""}, fmt.Errorf("malformed streaming chunk: %w", err)
+		return StreamChunk{Content: "", Reasoning: ""}, false, fmt.Errorf("malformed streaming chunk: %w", err)
 	}
 
 	if usage != nil && chunk.Usage != nil {
@@ -397,14 +421,20 @@ func processChunkLineWithMetadata(
 
 	if len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
 		logger.Debug("stream chunk missing delta")
-		return StreamChunk{Content: "", Reasoning: ""}, nil
+		return StreamChunk{Content: "", Reasoning: ""}, false, nil
 	}
 
 	delta := chunk.Choices[0].Delta
 	// Tool-call fragments feed the accumulator; they are never forwarded as
 	// chunks, so a caller only ever sees complete calls after the stream ends.
-	if tools != nil && len(delta.ToolCalls) > 0 {
-		tools.feed(delta.ToolCalls)
+	// The evidence flag reports the fact upwards because by the time the receive
+	// loop looks at the returned chunk the payload is gone from it.
+	toolEvidence := false
+	if delta.ToolCalls != nil {
+		toolEvidence = carriesToolPayload(delta.ToolCalls)
+		if tools != nil && len(delta.ToolCalls) > 0 {
+			tools.feed(delta.ToolCalls)
+		}
 	}
 	content := ""
 	if delta.Content != nil {
@@ -413,9 +443,31 @@ func processChunkLineWithMetadata(
 	reasoning := extractReasoning(delta)
 
 	if content == "" && reasoning == "" {
-		return StreamChunk{Content: "", Reasoning: ""}, nil
+		return StreamChunk{Content: "", Reasoning: ""}, toolEvidence, nil
 	}
-	return StreamChunk{Content: content, Reasoning: reasoning}, nil
+	return StreamChunk{Content: content, Reasoning: reasoning}, toolEvidence, nil
+}
+
+// carriesToolPayload reports whether a delta actually streamed part of a tool
+// call, as opposed to an empty slice or an all-empty fragment left by a
+// keep-alive. Only real payload bytes mean the upstream started generating: a
+// fragment must name the call or contribute to its arguments to count.
+func carriesToolPayload(deltas []toolCallDelta) bool {
+	for _, d := range deltas {
+		if d.ID != "" {
+			return true
+		}
+		if d.Function == nil {
+			continue
+		}
+		if d.Function.Name != "" {
+			return true
+		}
+		if d.Function.Arguments != nil && *d.Function.Arguments != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func extractReasoning(d *streamDelta) string {

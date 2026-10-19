@@ -51,7 +51,7 @@ func newToolCallServer(t *testing.T, finishReason string) *httptest.Server {
 
 func feedLine(t *testing.T, acc *toolCallAccumulator, payload string) {
 	t.Helper()
-	_, err := processChunkLineWithMetadata(newDefaultLogger(), "data: "+payload, nil, nil, acc)
+	_, _, err := processChunkLineWithMetadata(newDefaultLogger(), "data: "+payload, nil, nil, acc)
 	require.NoError(t, err)
 }
 
