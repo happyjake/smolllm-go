@@ -3,6 +3,7 @@ package smolllm
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -142,4 +143,80 @@ func TestStreamedFirstOutputTimeoutIsReportedToTheHook(t *testing.T) {
 	assert.GreaterOrEqual(t, e.TTFT, 100*time.Millisecond,
 		"TTFT should reflect the wait, got %v", e.TTFT)
 	assert.Error(t, e.Error)
+}
+
+// headerlessLeg accepts the request and never answers -- not even a status
+// line -- until the client gives up. silentLeg flushes headers first, so it
+// only exercises the "stream" phase; this one exercises "headers".
+func headerlessLeg(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain the body first: net/http only notices a client hang-up (and
+		// cancels r.Context) once the request body has been consumed.
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A streamed leg that times out before the upstream sends any headers must be
+// reported just like the blocking path reports it. streamOnce returned the
+// guard's headers-phase verdict bare, so this outcome -- an upstream that
+// accepted the connection and then said nothing -- was missing from the
+// ledger for streaming while Ask recorded it. Found live on 2026-10-20: one
+// blocking and one streamed request against such an upstream produced a
+// first_output_timeout count of 1, not 2.
+func TestStreamedHeadersPhaseTimeoutIsReportedToTheHook(t *testing.T) {
+	t.Parallel()
+
+	srv := headerlessLeg(t)
+	events, hook := collectEvents()
+
+	st, err := Stream(context.Background(), PromptFromString("hi"),
+		WithModel("openai/model-a"),
+		WithBaseURL(srv.URL+"/"),
+		WithAPIKey("test-key"),
+		WithFirstOutputTimeout(150*time.Millisecond),
+		WithTimeout(10*time.Second),
+		hook,
+	)
+	if err == nil {
+		err = st.Stream.Wait()
+	}
+	require.Error(t, err)
+	phase, ok := IsFirstOutputTimeout(err)
+	require.True(t, ok, "IsFirstOutputTimeout did not recognise %v", err)
+	assert.Equal(t, "headers", phase)
+
+	require.Len(t, *events, 1,
+		"a streamed headers-phase timeout must produce exactly one attempt event")
+	e := (*events)[0]
+	assert.True(t, e.FirstOutputTimeout, "event.FirstOutputTimeout = false, want true")
+	assert.Equal(t, "headers", e.FirstOutputPhase)
+	assert.GreaterOrEqual(t, e.TTFT, 100*time.Millisecond,
+		"TTFT should reflect the wait, got %v", e.TTFT)
+	assert.Error(t, e.Error)
+}
+
+// Ask has always reported this case; pin it so the two transports cannot
+// drift apart again.
+func TestBlockingHeadersPhaseTimeoutIsReportedToTheHook(t *testing.T) {
+	t.Parallel()
+
+	srv := headerlessLeg(t)
+	events, hook := collectEvents()
+
+	_, err := Ask(context.Background(), PromptFromString("hi"),
+		WithModel("openai/model-a"),
+		WithBaseURL(srv.URL+"/"),
+		WithAPIKey("test-key"),
+		WithFirstOutputTimeout(150*time.Millisecond),
+		WithTimeout(10*time.Second),
+		hook,
+	)
+	require.Error(t, err)
+	require.Len(t, *events, 1)
+	assert.True(t, (*events)[0].FirstOutputTimeout)
+	assert.Equal(t, "headers", (*events)[0].FirstOutputPhase)
 }

@@ -74,9 +74,13 @@ func streamOnce(ctx context.Context, prompt Prompt, opts Options, model string) 
 
 	resp, err := exec.do("starting stream")
 	if err != nil {
+		// The guard firing before headers arrive is still an attempt: report
+		// its verdict exactly as Ask does, or an upstream that accepts the
+		// connection and then says nothing vanishes from the ledger whenever
+		// the caller streams.
 		if guardErr := exec.firstOutputError("headers"); guardErr != nil {
 			exec.cancel()
-			return nil, guardErr
+			return fail(guardErr)
 		}
 		exec.cancel()
 		return fail(err)
