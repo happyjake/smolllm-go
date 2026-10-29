@@ -59,9 +59,15 @@ func runChain[T any](ctx context.Context, opts Options, attempt func(model strin
 			}
 		}
 
+		// Settled by defer so an attempt that panics (a caller's stream handler,
+		// say) still releases a half-open lease as inconclusive; otherwise the
+		// account would look probed-in-flight forever and never be tried again.
+		outcome := legInconclusive
+		if account != "" {
+			defer func() { breaker.record(opts.Logger, account, probe, outcome) }()
+		}
 		resp, err := withRetry(ctx, opts.Logger, model, func() (T, error) { return attempt(model) })
 		if account != "" {
-			outcome := legInconclusive
 			switch {
 			case err == nil:
 				outcome = legSucceeded
@@ -69,7 +75,6 @@ func runChain[T any](ctx context.Context, opts Options, attempt func(model strin
 				outcome = legQuotaExhausted
 				exhausted[account] = true
 			}
-			breaker.record(opts.Logger, account, probe, outcome)
 		}
 		return resp, true, err
 	}

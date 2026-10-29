@@ -141,6 +141,36 @@ func TestQuotaExhaustionSkipsRemainingSameAccountLegsInAsk(t *testing.T) {
 	assert.Equal(t, 1, up.calls("c"))
 }
 
+// A probe whose attempt panics (here: the caller's stream handler) must still
+// release the half-open lease. Otherwise the account stays half-open with a
+// probe "in flight" forever and is never attempted again.
+func TestPanickingProbeReleasesTheLeaseForALaterProbe(t *testing.T) {
+	t.Parallel()
+	up := newScriptedUpstream(t)
+	up.script("a", quotaExhausted)
+	up.script("c", answer(t, "other provider"))
+	clock := newFakeClock()
+	breaker := newAccountBreaker(clock.Now)
+	opts := up.options("doom/a,zai/c", WithAccountBreaker(breaker))
+
+	_, err := Ask(context.Background(), PromptFromString("hi"), opts...)
+	require.NoError(t, err)
+	clock.Advance(accountCooldownBase)
+
+	up.script("a", answer(t, "recovered"))
+	panicHandler := WithStreamHandler(func(context.Context, string) error { panic("caller bug") })
+	panicking := up.options("doom/a,zai/c", WithAccountBreaker(breaker), panicHandler)
+	assert.PanicsWithValue(t, "caller bug", func() {
+		_, _ = Ask(context.Background(), PromptFromString("hi"), panicking...)
+	})
+	require.Equal(t, 2, up.calls("a"), "the panicking request was the probe")
+
+	resp, err := Ask(context.Background(), PromptFromString("hi"), opts...)
+	require.NoError(t, err)
+	assert.Equal(t, "recovered", resp.Text, "a later request must be able to probe again")
+	assert.Equal(t, 3, up.calls("a"))
+}
+
 func TestOpenAccountIsSkippedOnLaterRequestsUntilCooldownProbeSucceeds(t *testing.T) {
 	t.Parallel()
 	up := newScriptedUpstream(t)
