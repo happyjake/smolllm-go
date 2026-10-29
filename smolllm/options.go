@@ -85,6 +85,8 @@ type Options struct {
 	// AccountBreaker, when set, skips fallback legs whose provider account
 	// reported quota exhaustion. Nil (the default) keeps plain fallback.
 	AccountBreaker *AccountBreaker
+	// AccountEventHook receives AccountBreaker decisions; see WithAccountEventHook.
+	AccountEventHook func(AccountEvent)
 }
 
 func defaultOptions() Options {
@@ -112,6 +114,7 @@ func defaultOptions() Options {
 		Dimensions:         0,
 		ExtraBody:          nil,
 		AccountBreaker:     nil,
+		AccountEventHook:   nil,
 	}
 }
 

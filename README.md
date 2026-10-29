@@ -79,7 +79,7 @@ Flags:
 - markdown fence stripping via `WithBacktickRemoval`
 - fail-fast validation for env, prompts, and responses, including proactive model/API-key checks via `smolllm.Validate` (invoked automatically by the CLI)
 - raw request fields the library does not model via `WithExtraBody`
-- opt-in account circuit breaker via `WithAccountBreaker(smolllm.NewAccountBreaker())`: a structured quota-exhausted 429 (business code 14019) skips every leg on that provider credential for the rest of the request and, process-locally, for a 5m→60m exponential cooldown; one lazy real request probes after cooldown; an all-open chain fails open
+- opt-in account circuit breaker via `WithAccountBreaker(smolllm.NewAccountBreaker())`: a structured quota-exhausted 429 (business code 14019) skips every leg on that provider credential for the rest of the request and, process-locally, for a 5m→60m exponential cooldown; one lazy real request probes after cooldown; an all-open chain fails open. Observe it with `WithAccountEventHook` (opened/closed/probing/skipped/fail-open/unrecognized structured 429, labelled by provider and a 12-hex credential fingerprint — never the key) and `(*AccountBreaker).Circuits()` (open/half-open snapshot); skipped legs never reach `WithHook`
 
 ## Escape Hatch
 

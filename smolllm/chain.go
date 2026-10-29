@@ -33,28 +33,43 @@ func runChain[T any](ctx context.Context, opts Options, attempt func(model strin
 	var lastErr error
 
 	runLeg := func(model string, failOpen bool) (T, bool, error) {
-		account := ""
-		probe := false
+		leg := legAccount{provider: "", modelName: "", fingerprint: ""}
 		if breaker != nil {
-			account = accountFingerprint(opts, model)
+			leg = resolveLegAccount(opts, model)
+		}
+		account := leg.fingerprint
+		probe := false
+		emit := func(kind AccountEventKind, skipReason string) {
+			if opts.AccountEventHook == nil || kind == "" {
+				return
+			}
+			_, label := splitAccount(account)
+			opts.AccountEventHook(AccountEvent{
+				Kind: kind, Provider: leg.provider, Account: label, ModelName: leg.modelName, SkipReason: skipReason,
+			})
 		}
 		if account != "" {
 			if exhausted[account] {
 				opts.Logger.Warn("skipping model: account quota exhausted earlier in this request",
 					"model", model, "account", shortFingerprint(account))
+				emit(AccountSkipped, SkipExhaustedInRequest)
 				return zero, false, nil
 			}
-			if !failOpen {
+			if failOpen {
+				emit(AccountFailOpen, "")
+			} else {
 				var ok bool
 				ok, probe = breaker.admit(account)
 				if !ok {
 					opts.Logger.Warn("skipping model: account circuit open",
 						"model", model, "account", shortFingerprint(account))
+					emit(AccountSkipped, SkipCircuitOpen)
 					refused = append(refused, model)
 					return zero, false, nil
 				}
 				if probe {
 					opts.Logger.Info("probing account after cooldown", "model", model, "account", shortFingerprint(account))
+					emit(AccountProbing, "")
 				}
 			}
 		}
@@ -64,7 +79,7 @@ func runChain[T any](ctx context.Context, opts Options, attempt func(model strin
 		// account would look probed-in-flight forever and never be tried again.
 		outcome := legInconclusive
 		if account != "" {
-			defer func() { breaker.record(opts.Logger, account, probe, outcome) }()
+			defer func() { emit(breaker.record(opts.Logger, account, probe, outcome), "") }()
 		}
 		resp, err := withRetry(ctx, opts.Logger, model, func() (T, error) { return attempt(model) })
 		if account != "" {
@@ -74,6 +89,8 @@ func runChain[T any](ctx context.Context, opts Options, attempt func(model strin
 			case isQuotaExhausted(err):
 				outcome = legQuotaExhausted
 				exhausted[account] = true
+			case isUnrecognizedStructured429(err):
+				emit(AccountUnrecognized429, "")
 			}
 		}
 		return resp, true, err
