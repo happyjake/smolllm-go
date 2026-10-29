@@ -38,7 +38,7 @@ _Avoid_: mixing reasoning into content.
 Verbatim provider string explaining why generation ended; never normalized.
 
 **Request hook**:
-Per-attempt observation callback receiving usage or error; the library's only telemetry surface.
+Per-attempt observation callback receiving usage or error. In smolllm-go, account-breaker events and read-only circuit snapshots are separate telemetry surfaces; skipped legs never enter this per-attempt hook.
 
 **Escape hatch**:
 A pass-through (`WithExtraBody`) letting callers set raw request fields the library does not model, merged last so the caller wins. The fields the library machinery reads back (`stream`, `stream_options`, `messages`, `model`) are rejected.
