@@ -22,44 +22,9 @@ func Ask(ctx context.Context, prompt Prompt, opts ...Option) (*Response, error) 
 		return nil, errors.New("WithoutStreaming is incompatible with WithStreamHandler")
 	}
 
-	selector, err := createSelector(options)
-	if err != nil {
-		return nil, err
-	}
-
-	var lastErr error
-	for {
-		model, ok := selector.NextModel()
-		if !ok {
-			break
-		}
-		resp, err := withRetry(ctx, options.Logger, model, func() (*Response, error) {
-			return askOnce(ctx, prompt, options, model)
-		})
-		if err != nil {
-			lastErr = err
-			// A dead caller context is not a per-model failure: every remaining
-			// leg would dial with a cancelled context, fail in microseconds and
-			// log a fallback warning that never represented a real attempt.
-			// Stop here so the cancellation surfaces as itself.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				options.Logger.Warn("aborting fallback chain: caller context is done", "model", model, "error", ctxErr.Error())
-				return nil, ctxErr
-			}
-			if selector.HasMore() {
-				options.Logger.Warn("model failed, trying fallback", "model", model, "error", err.Error())
-			} else {
-				options.Logger.Warn("model failed", "model", model, "error", err.Error())
-			}
-			continue
-		}
-		return resp, nil
-	}
-
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("no models were attempted")
+	return runChain(ctx, options, func(model string) (*Response, error) {
+		return askOnce(ctx, prompt, options, model)
+	})
 }
 
 func askOnce(ctx context.Context, prompt Prompt, opts Options, model string) (*Response, error) {

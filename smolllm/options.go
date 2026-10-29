@@ -82,32 +82,36 @@ type Options struct {
 	ProviderHeaders map[string]http.Header
 	// DisableStreaming makes Ask issue a plain stream:false request.
 	DisableStreaming bool
+	// AccountBreaker, when set, skips fallback legs whose provider account
+	// reported quota exhaustion. Nil (the default) keeps plain fallback.
+	AccountBreaker *AccountBreaker
 }
 
 func defaultOptions() Options {
 	return Options{
-		SystemPrompt:    "",
-		Model:           "",
-		Selector:        nil,
-		Temperature:     nil,
-		TopP:            nil,
-		MaxTokens:       nil,
-		Stop:            nil,
-		Seed:            nil,
-		ReasoningEffort: nil,
-		APIKey:          "",
-		BaseURL:         "",
-		ImagePaths:      nil,
-		Timeout:         600 * time.Second,
+		SystemPrompt:       "",
+		Model:              "",
+		Selector:           nil,
+		Temperature:        nil,
+		TopP:               nil,
+		MaxTokens:          nil,
+		Stop:               nil,
+		Seed:               nil,
+		ReasoningEffort:    nil,
+		APIKey:             "",
+		BaseURL:            "",
+		ImagePaths:         nil,
+		Timeout:            600 * time.Second,
 		FirstOutputTimeout: defaultFirstOutputTimeout,
-		RemoveBackticks: false,
-		StreamHandler:   nil,
-		HTTPClient:      nil,
-		Logger:          newDefaultLogger(),
-		Hook:            nil,
-		MinOutputTokens: 0,
-		Dimensions:      0,
-		ExtraBody:       nil,
+		RemoveBackticks:    false,
+		StreamHandler:      nil,
+		HTTPClient:         nil,
+		Logger:             newDefaultLogger(),
+		Hook:               nil,
+		MinOutputTokens:    0,
+		Dimensions:         0,
+		ExtraBody:          nil,
+		AccountBreaker:     nil,
 	}
 }
 
@@ -273,6 +277,15 @@ func WithTimeout(timeout time.Duration) Option {
 func WithFirstOutputTimeout(timeout time.Duration) Option {
 	return func(o *Options) {
 		o.FirstOutputTimeout = timeout
+	}
+}
+
+// WithAccountBreaker routes the fallback chain through a shared, process-local
+// account circuit breaker. Pass the same breaker to every call: its state is
+// what lets later requests skip an account an earlier one found exhausted.
+func WithAccountBreaker(breaker *AccountBreaker) Option {
+	return func(o *Options) {
+		o.AccountBreaker = breaker
 	}
 }
 
