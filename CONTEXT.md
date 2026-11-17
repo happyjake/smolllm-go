@@ -22,7 +22,7 @@ Re-attempt of the *same* model after a transient failure. Distinct from fallback
 The provider plus the credential a leg resolves to; every model behind it shares one quota. Identified only by a non-reversible fingerprint.
 
 **Account circuit**:
-Process-local breaker state for one account+model pair, opened by a structured quota-exhaustion error (doom HTTP 429, business code 14019) and skipping only that pair's legs until a bounded cooldown, then one lazy probe. Sibling models on the same credential are unaffected: the upstream reuses the code for account-wide and model-local causes (unregistered model names) and free-tier models keep serving while billed ones are rejected.
+Process-local breaker state for one account+model pair, opened by a structured quota-exhaustion error (doom HTTP 429, business code 14019) and skipping only that pair's legs until a bounded cooldown, then one lazy probe. Sibling models on the same credential are unaffected: the upstream reuses the code for account-wide and model-local causes (unregistered model names) and free-tier models keep serving while billed ones are rejected. The map is bounded (maxAccountCircuits) independently of the model names requests send: past the bound, new pairs run unguarded rather than growing the map.
 
 **Balancer pair**:
 One (API key, base URL) combination for a provider; the least-used pair is chosen per call.
