@@ -669,3 +669,29 @@ func TestSplitAccountHandlesNulModelNames(t *testing.T) {
 	assert.Equal(t, "abcdef012345", label)
 	assert.Empty(t, model, "a bare legacy account key has no model half")
 }
+
+// The provider name arrives in the same request-borne model string as the
+// model, so it is part of every key and must respect a byte cap too; a NUL in
+// it would corrupt key parsing. Both cases run unguarded instead.
+func TestHostileProviderNamesRunUnguarded(t *testing.T) {
+	t.Parallel()
+	for name, provider := range map[string]string{
+		"overlong": strings.Repeat("p", maxBreakerProviderLen+1),
+		"nul":      "do\x00om",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			up := newScriptedUpstream(t)
+			up.script("m", quotaExhausted)
+			breaker := newAccountBreaker(newFakeClock().Now)
+
+			for range 2 {
+				_, err := Ask(context.Background(), PromptFromString("hi"), up.options(provider+"/m", WithAccountBreaker(breaker))...)
+				require.Error(t, err)
+				assert.True(t, isQuotaExhausted(err))
+			}
+			assert.Equal(t, 2, up.calls("m"), "an unguarded pair is attempted every request")
+			assert.Empty(t, breaker.Circuits(), "no circuit is stored for a hostile provider name")
+		})
+	}
+}

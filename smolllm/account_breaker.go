@@ -41,6 +41,26 @@ const maxAccountCircuits = 4096
 // parking a request-sized string in the breaker map. Real names are short.
 const maxBreakerModelLen = 256
 
+// maxBreakerProviderLen caps the other variable part of a key: the provider
+// name arrives in the same request-borne model string ("provider/model") and
+// would otherwise bypass the model-length bound.
+const maxBreakerProviderLen = 64
+
+// breakerKey returns the account+model circuit key for the leg, or ok=false
+// when the leg must run unguarded: a variable part exceeds its length cap
+// (the map bound counts entries, not bytes), or the provider name contains a
+// NUL, which would corrupt key parsing (the fingerprint is provider plus hex
+// and otherwise NUL-free, so the first NUL is the separator).
+func (leg legAccount) breakerKey() (string, bool) {
+	if leg.fingerprint == "" || len(leg.modelName) > maxBreakerModelLen {
+		return "", false
+	}
+	if len(leg.provider) > maxBreakerProviderLen || strings.IndexByte(leg.provider, 0) >= 0 {
+		return "", false
+	}
+	return leg.fingerprint + "\x00" + leg.modelName, true
+}
+
 // AccountBreaker is a process-local circuit breaker keyed by provider account
 // plus model (provider name, a fingerprint of the configured credential, and
 // the model name). Once a leg reports structured quota exhaustion, that
