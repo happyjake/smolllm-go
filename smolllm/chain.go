@@ -11,15 +11,19 @@ import (
 // including streamed output that can no longer be retracted — is the
 // caller's.
 //
-// With an AccountBreaker, a leg whose account circuit is open is skipped, and
-// an account that reports quota exhaustion is skipped for the rest of this
-// request even if the shared breaker closes concurrently. When the chain ends
-// without a success — every leg refused (all accounts open), or the admitted
-// legs all failed — it fails open and attempts the refused legs as a last
-// resort, so the breaker only ever reorders attempts and never makes
-// availability worse than having no breaker. Legs on an account that reported
-// quota exhaustion in this very request stay skipped: that is fresh evidence,
-// not a stale circuit.
+// With an AccountBreaker, a leg whose account+model circuit is open is
+// skipped, and a leg that reports quota exhaustion is skipped for the rest of
+// this request even if the shared breaker closes concurrently — both scoped
+// to that one account+model pair. Sibling models on the same credential are
+// unaffected: the upstream quota code does not distinguish account-wide
+// exhaustion from model-local causes (unregistered model names reuse it), and
+// free-tier models sharing the credential keep serving while billed ones are
+// rejected. When the chain ends without a success — every leg refused (all
+// attempted pairs open), or the admitted legs all failed — it fails open and
+// attempts the refused legs as a last resort, so the breaker only ever
+// reorders attempts and never makes availability worse than having no
+// breaker. A leg whose pair reported quota exhaustion in this very request
+// stays skipped: that is fresh evidence, not a stale circuit.
 func runChain[T any](ctx context.Context, opts Options, attempt func(model string) (T, error)) (T, error) {
 	var zero T
 	selector, err := createSelector(opts)
@@ -37,20 +41,25 @@ func runChain[T any](ctx context.Context, opts Options, attempt func(model strin
 		if breaker != nil {
 			leg = resolveLegAccount(opts, model)
 		}
-		account := leg.fingerprint
+		// The breaker key pairs the credential with the model: quota rejections
+		// are scoped to the account+model that reported them, never to siblings.
+		account := ""
+		if leg.fingerprint != "" {
+			account = leg.fingerprint + "\x00" + leg.modelName
+		}
 		probe := false
 		emit := func(kind AccountEventKind, skipReason string) {
 			if opts.AccountEventHook == nil || kind == "" {
 				return
 			}
-			_, label := splitAccount(account)
+			_, label, _ := splitAccount(account)
 			opts.AccountEventHook(AccountEvent{
 				Kind: kind, Provider: leg.provider, Account: label, ModelName: leg.modelName, SkipReason: skipReason,
 			})
 		}
 		if account != "" {
 			if exhausted[account] {
-				opts.Logger.Warn("skipping model: account quota exhausted earlier in this request",
+				opts.Logger.Warn("skipping model: quota exhausted earlier in this request",
 					"model", model, "account", shortFingerprint(account))
 				emit(AccountSkipped, SkipExhaustedInRequest)
 				return zero, false, nil

@@ -125,7 +125,7 @@ func answer(t *testing.T, text string) http.HandlerFunc {
 
 const botChain = "doom/a,doom/b,zai/c"
 
-func TestQuotaExhaustionSkipsRemainingSameAccountLegsInAsk(t *testing.T) {
+func TestQuotaExhaustionDoesNotSkipSiblingModelsOnTheSameAccount(t *testing.T) {
 	t.Parallel()
 	up := newScriptedUpstream(t)
 	up.script("a", quotaExhausted)
@@ -133,12 +133,17 @@ func TestQuotaExhaustionSkipsRemainingSameAccountLegsInAsk(t *testing.T) {
 	up.script("c", answer(t, "other provider"))
 	breaker := newAccountBreaker(newFakeClock().Now)
 
-	resp, err := Ask(context.Background(), PromptFromString("hi"), up.options(botChain, WithAccountBreaker(breaker))...)
-	require.NoError(t, err)
-	assert.Equal(t, "other provider", resp.Text)
-	assert.Equal(t, 1, up.calls("a"))
-	assert.Equal(t, 0, up.calls("b"), "the second model on the exhausted account must never be called")
-	assert.Equal(t, 1, up.calls("c"))
+	// The quota code is reused by the upstream for account-wide and
+	// model-local causes alike; free-tier models on the same credential keep
+	// serving. So the sibling model must be attempted and can succeed.
+	for range 2 {
+		resp, err := Ask(context.Background(), PromptFromString("hi"), up.options(botChain, WithAccountBreaker(breaker))...)
+		require.NoError(t, err)
+		assert.Equal(t, "same account", resp.Text)
+	}
+	assert.Equal(t, 1, up.calls("a"), "only model a itself is circuit-open after its quota rejection")
+	assert.Equal(t, 2, up.calls("b"), "the sibling model on the same account must not be skipped")
+	assert.Equal(t, 0, up.calls("c"))
 }
 
 // A probe whose attempt panics (here: the caller's stream handler) must still
@@ -171,7 +176,7 @@ func TestPanickingProbeReleasesTheLeaseForALaterProbe(t *testing.T) {
 	assert.Equal(t, 3, up.calls("a"))
 }
 
-func TestOpenAccountIsSkippedOnLaterRequestsUntilCooldownProbeSucceeds(t *testing.T) {
+func TestOpenPairIsSkippedOnLaterRequestsUntilCooldownProbeSucceeds(t *testing.T) {
 	t.Parallel()
 	up := newScriptedUpstream(t)
 	up.script("a", quotaExhausted)
@@ -186,20 +191,23 @@ func TestOpenAccountIsSkippedOnLaterRequestsUntilCooldownProbeSucceeds(t *testin
 		return resp.Text
 	}
 
-	assert.Equal(t, "other provider", ask())
+	// Model a is circuit-open, but its sibling b on the same account keeps
+	// serving, so the chain answers from b throughout the cooldown.
+	assert.Equal(t, "same account", ask())
 	clock.Advance(4 * time.Minute)
-	assert.Equal(t, "other provider", ask())
-	assert.Equal(t, 1, up.calls("a"), "an open account must not be attempted before its cooldown")
-	assert.Equal(t, 0, up.calls("b"))
+	assert.Equal(t, "same account", ask())
+	assert.Equal(t, 1, up.calls("a"), "an open pair must not be attempted before its cooldown")
+	assert.Equal(t, 2, up.calls("b"))
 
-	// Quota restored: the first real request after cooldown probes the account
-	// and, on success, the account is preferred again.
+	// Quota restored: the first real request after cooldown probes model a and,
+	// on success, the pair is preferred again.
 	up.script("a", answer(t, "recovered"))
 	clock.Advance(time.Minute)
 	assert.Equal(t, "recovered", ask())
 	assert.Equal(t, "recovered", ask())
 	assert.Equal(t, 3, up.calls("a"))
-	assert.Equal(t, 2, up.calls("c"))
+	assert.Equal(t, 2, up.calls("b"))
+	assert.Equal(t, 0, up.calls("c"))
 }
 
 func TestOrdinaryRateLimitStaysModelLocal(t *testing.T) {
@@ -319,10 +327,10 @@ func TestHalfOpenAdmitsOneProbeWhileConcurrentRequestsSkip(t *testing.T) {
 	}
 	wg.Wait()
 	for _, text := range texts {
-		assert.Equal(t, "other provider", text, "a request must not join an in-flight probe")
+		assert.Equal(t, "same account", text, "a request must not join an in-flight probe; it falls to the sibling, not off the account")
 	}
-	assert.Equal(t, 2, up.calls("a"), "exactly one probe reaches the account")
-	assert.Equal(t, 0, up.calls("b"))
+	assert.Equal(t, 2, up.calls("a"), "exactly one probe reaches the open pair")
+	assert.Equal(t, concurrent+1, up.calls("b"), "concurrent requests fall to the sibling model")
 
 	close(release)
 	assert.Equal(t, "recovered", <-probe)
@@ -354,11 +362,11 @@ func TestAllOpenChainFailsOpen(t *testing.T) {
 	assert.Equal(t, 2, up.calls("b"))
 }
 
-func TestFailOpenStillSkipsAccountExhaustedInThisRequest(t *testing.T) {
+func TestFailOpenStillSkipsPairExhaustedInThisRequest(t *testing.T) {
 	t.Parallel()
 	up := newScriptedUpstream(t)
 	up.script("a", quotaExhausted)
-	up.script("b", answer(t, "same account"))
+	up.script("b", quotaExhausted)
 	up.script("c", quotaExhausted)
 	breaker := newAccountBreaker(newFakeClock().Now)
 
@@ -366,11 +374,11 @@ func TestFailOpenStillSkipsAccountExhaustedInThisRequest(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, isQuotaExhausted(err), "the last real failure surfaces, got %v", err)
 	assert.Equal(t, 1, up.calls("a"))
-	assert.Equal(t, 0, up.calls("b"))
+	assert.Equal(t, 1, up.calls("b"), "the sibling model is attempted: quota rejections are per model")
 	assert.Equal(t, 1, up.calls("c"))
 }
 
-func TestQuotaExhaustionSkipsSameAccountLegsInStreamAndLaterStreams(t *testing.T) {
+func TestQuotaExhaustedModelIsSkippedInStreamAndLaterStreams(t *testing.T) {
 	t.Parallel()
 	up := newScriptedUpstream(t)
 	up.script("a", quotaExhausted)
@@ -388,11 +396,11 @@ func TestQuotaExhaustionSkipsSameAccountLegsInStreamAndLaterStreams(t *testing.T
 		return text
 	}
 
-	assert.Equal(t, "other provider", stream())
-	assert.Equal(t, "other provider", stream())
-	assert.Equal(t, 1, up.calls("a"))
-	assert.Equal(t, 0, up.calls("b"), "the second model on the exhausted account must never be called")
-	assert.Equal(t, 2, up.calls("c"))
+	assert.Equal(t, "same account", stream())
+	assert.Equal(t, "same account", stream())
+	assert.Equal(t, 1, up.calls("a"), "the quota-rejected model is circuit-open after its first rejection")
+	assert.Equal(t, 2, up.calls("b"), "the sibling model on the same account keeps serving")
+	assert.Equal(t, 0, up.calls("c"))
 }
 
 // A streamed probe succeeds at its first output: the account closes even though
@@ -479,6 +487,7 @@ func TestBreakerLogsNeverCarryTheCredential(t *testing.T) {
 	const secret = "sk-very-secret-account-credential"
 	up := newScriptedUpstream(t)
 	up.script("a", quotaExhausted)
+	up.script("b", answer(t, "same account"))
 	up.script("c", answer(t, "other provider"))
 	clock := newFakeClock()
 	breaker := newAccountBreaker(clock.Now)
@@ -520,8 +529,8 @@ func TestQuotaCodeIsRecognisedWithoutTheErrorWrapper(t *testing.T) {
 
 	resp, err := Ask(context.Background(), PromptFromString("hi"), up.options(botChain, WithAccountBreaker(breaker))...)
 	require.NoError(t, err)
-	assert.Equal(t, "other provider", resp.Text)
-	assert.Equal(t, 0, up.calls("b"))
+	assert.Equal(t, "same account", resp.Text)
+	assert.Equal(t, 1, up.calls("b"), "the sibling model is attempted: quota rejections are per model")
 }
 
 func TestWithoutBreakerQuotaExhaustionKeepsPlainFallback(t *testing.T) {

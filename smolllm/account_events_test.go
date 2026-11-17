@@ -72,21 +72,18 @@ func TestAccountEventsReportTransitionsSkipsAndOpenState(t *testing.T) {
 	first := log.take()
 	assert.Equal(t, []eventShape{
 		{Kind: AccountOpened, Provider: "doom", ModelName: "a", SkipReason: ""},
-		{Kind: AccountSkipped, Provider: "doom", ModelName: "b", SkipReason: SkipExhaustedInRequest},
-	}, shapes(first))
+	}, shapes(first), "the sibling model b runs and succeeds; it is not skipped")
 	doom := first[0].Account
 	assert.Regexp(t, shortHex, doom, "the account label is a short hash, never the credential")
-	assert.Equal(t, doom, first[1].Account, "legs on one credential share one account")
-	assert.Equal(t, []AccountCircuit{{Provider: "doom", Account: doom, State: CircuitOpen}}, breaker.Circuits())
+	assert.Equal(t, []AccountCircuit{{Provider: "doom", Account: doom, ModelName: "a", State: CircuitOpen}}, breaker.Circuits())
 
 	ask()
 	assert.Equal(t, []eventShape{
 		{Kind: AccountSkipped, Provider: "doom", ModelName: "a", SkipReason: SkipCircuitOpen},
-		{Kind: AccountSkipped, Provider: "doom", ModelName: "b", SkipReason: SkipCircuitOpen},
-	}, shapes(log.take()))
+	}, shapes(log.take()), "only the quota-rejected model is skipped; b answers again")
 
 	clock.Advance(accountCooldownBase)
-	assert.Equal(t, []AccountCircuit{{Provider: "doom", Account: doom, State: CircuitHalfOpen}}, breaker.Circuits())
+	assert.Equal(t, []AccountCircuit{{Provider: "doom", Account: doom, ModelName: "a", State: CircuitHalfOpen}}, breaker.Circuits())
 
 	up.script("a", answer(t, "recovered"))
 	ask()
@@ -94,7 +91,7 @@ func TestAccountEventsReportTransitionsSkipsAndOpenState(t *testing.T) {
 		{Kind: AccountProbing, Provider: "doom", ModelName: "a", SkipReason: ""},
 		{Kind: AccountClosed, Provider: "doom", ModelName: "a", SkipReason: ""},
 	}, shapes(log.take()))
-	assert.Empty(t, breaker.Circuits(), "a closed account leaves no circuit behind")
+	assert.Empty(t, breaker.Circuits(), "a closed pair leaves no circuit behind")
 }
 
 func TestAccountEventsReportFailOpenAttempts(t *testing.T) {

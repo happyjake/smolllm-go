@@ -22,7 +22,7 @@ Re-attempt of the *same* model after a transient failure. Distinct from fallback
 The provider plus the credential a leg resolves to; every model behind it shares one quota. Identified only by a non-reversible fingerprint.
 
 **Account circuit**:
-Process-local breaker state for one account, opened by a structured quota-exhausted error (doom HTTP 429, business code 14019) and skipping the account's legs until a bounded cooldown, then one lazy probe. Distinct from retry (same leg) and fallback (next leg): it decides which untouched legs may start.
+Process-local breaker state for one account+model pair, opened by a structured quota-exhaustion error (doom HTTP 429, business code 14019) and skipping only that pair's legs until a bounded cooldown, then one lazy probe. Sibling models on the same credential are unaffected: the upstream reuses the code for account-wide and model-local causes (unregistered model names) and free-tier models keep serving while billed ones are rejected.
 
 **Balancer pair**:
 One (API key, base URL) combination for a provider; the least-used pair is chosen per call.
