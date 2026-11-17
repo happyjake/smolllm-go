@@ -36,6 +36,11 @@ const (
 // chain fan-out and caps the map at a few hundred kilobytes.
 const maxAccountCircuits = 4096
 
+// maxBreakerModelLen bounds one entry's byte size: a model name longer than
+// this gets no circuit (attempted every request, like no breaker) instead of
+// parking a request-sized string in the breaker map. Real names are short.
+const maxBreakerModelLen = 256
+
 // AccountBreaker is a process-local circuit breaker keyed by provider account
 // plus model (provider name, a fingerprint of the configured credential, and
 // the model name). Once a leg reports structured quota exhaustion, that

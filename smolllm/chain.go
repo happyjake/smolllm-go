@@ -43,8 +43,10 @@ func runChain[T any](ctx context.Context, opts Options, attempt func(model strin
 		}
 		// The breaker key pairs the credential with the model: quota rejections
 		// are scoped to the account+model that reported them, never to siblings.
+		// Absurdly long names get no circuit: the bound is on entries, and an
+		// entry's byte size is dominated by the model string, so cap it too.
 		account := ""
-		if leg.fingerprint != "" {
+		if leg.fingerprint != "" && len(leg.modelName) <= maxBreakerModelLen {
 			account = leg.fingerprint + "\x00" + leg.modelName
 		}
 		probe := false

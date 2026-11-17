@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -567,15 +568,48 @@ func TestDuplicatePairIsSkippedWithinOneRequest(t *testing.T) {
 		{Kind: AccountSkipped, Provider: "doom", ModelName: "a", SkipReason: SkipExhaustedInRequest},
 	}, shapes(log.take()))
 
-	// All-fail variant: fail-open retries refused (circuit-skipped) legs, but
-	// the pair that reported quota exhaustion in this request stays skipped.
+	// All-fail variant with a real fail-open: request 1 opens the circuit,
+	// then request 2 repeats the leg. Both skips refuse the leg, fail-open
+	// retries it once, and the fresh 14019 must stop the second retry.
 	up2 := newScriptedUpstream(t)
 	up2.script("a", quotaExhausted)
-	breaker2 := newAccountBreaker(newFakeClock().Now)
-	_, err = Ask(context.Background(), PromptFromString("hi"), up2.options("doom/a,doom/a", WithAccountBreaker(breaker2))...)
+	clock2 := newFakeClock()
+	breaker2 := newAccountBreaker(clock2.Now)
+	var log2 eventLog
+	opts2 := up2.options("doom/a", WithAccountBreaker(breaker2), WithAccountEventHook(log2.record))
+	_, err = Ask(context.Background(), PromptFromString("hi"), opts2...)
+	require.Error(t, err)
+	assert.Equal(t, []eventShape{{Kind: AccountOpened, Provider: "doom", ModelName: "a"}}, shapes(log2.take()))
+
+	opts2 = up2.options("doom/a,doom/a", WithAccountBreaker(breaker2), WithAccountEventHook(log2.record))
+	_, err = Ask(context.Background(), PromptFromString("hi"), opts2...)
 	require.Error(t, err)
 	assert.True(t, isQuotaExhausted(err))
-	assert.Equal(t, 1, up2.calls("a"), "fail-open must not retry a pair exhausted in this request")
+	assert.Equal(t, 2, up2.calls("a"), "one opener plus exactly one fail-open attempt")
+	assert.Equal(t, []eventShape{
+		{Kind: AccountSkipped, Provider: "doom", ModelName: "a", SkipReason: SkipCircuitOpen},
+		{Kind: AccountSkipped, Provider: "doom", ModelName: "a", SkipReason: SkipCircuitOpen},
+		{Kind: AccountFailOpen, Provider: "doom", ModelName: "a"},
+		{Kind: AccountSkipped, Provider: "doom", ModelName: "a", SkipReason: SkipExhaustedInRequest},
+	}, shapes(log2.take()), "the retried pair's fresh rejection skips the second retry")
+}
+
+// An absurdly long model name gets no circuit rather than parking a
+// request-sized string in the bounded map; it is attempted every request.
+func TestOverlongModelNameRunsUnguarded(t *testing.T) {
+	t.Parallel()
+	up := newScriptedUpstream(t)
+	long := strings.Repeat("x", maxBreakerModelLen+1)
+	up.script(long, quotaExhausted)
+	breaker := newAccountBreaker(newFakeClock().Now)
+
+	for range 2 {
+		_, err := Ask(context.Background(), PromptFromString("hi"), up.options("doom/"+long, WithAccountBreaker(breaker))...)
+		require.Error(t, err)
+		assert.True(t, isQuotaExhausted(err))
+	}
+	assert.Equal(t, 2, up.calls(long), "an unguarded pair is attempted every request")
+	assert.Empty(t, breaker.Circuits(), "no circuit is stored for an overlong name")
 }
 
 // The breaker map is bounded independently of the model names requests send:
@@ -606,18 +640,19 @@ func TestBreakerCapsAccountModelEntries(t *testing.T) {
 	assert.Equal(t, 2, up.calls("m3"), "a pair without a circuit must stay attemptable")
 	assert.Len(t, breaker.Circuits(), 2)
 
-	// After every cooldown lapses, opening a new circuit evicts idle ones to
-	// make room; the map stays within its bound.
+	// After every cooldown lapses, opening a new circuit evicts an idle one to
+	// make room. makeRoom iterates a Go map, so which lapsed circuit goes is
+	// unspecified: assert the bound and membership, never the winner.
 	clock.Advance(accountCooldownMax + time.Minute)
 	require.Error(t, ask("m3"))
 	circuits := breaker.Circuits()
-	assert.LessOrEqual(t, len(circuits), 2, "the bound is an invariant, not a one-shot")
+	assert.Len(t, circuits, 2, "one lapsed circuit evicted, the fresh one inserted")
 	names := map[string]bool{}
 	for _, c := range circuits {
 		names[c.ModelName] = true
 	}
-	assert.False(t, names["m1"], "a lapsed circuit is evicted to make room")
 	assert.True(t, names["m3"], "the fresh circuit is kept")
+	assert.True(t, names["m1"] != names["m2"], "exactly one of the lapsed circuits was evicted")
 }
 
 func TestSplitAccountHandlesNulModelNames(t *testing.T) {

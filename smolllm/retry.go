@@ -15,8 +15,8 @@ const (
 	// eat the chain's budget. Three such legs stay well inside the 300s header
 	// timeout the bundled pi client applies (DEFAULT_HTTP_IDLE_TIMEOUT_MS).
 	defaultFirstOutputTimeout = 30 * time.Second
-	retryMaxDelay     = 30 * time.Second
-	retryBackoffScale = 2
+	retryMaxDelay             = 30 * time.Second
+	retryBackoffScale         = 2
 )
 
 // isRetryableHTTPStatus reports whether the given HTTP status should be retried
