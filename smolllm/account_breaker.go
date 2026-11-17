@@ -26,6 +26,16 @@ const (
 	quotaExhaustedCode = 14019
 )
 
+// maxAccountCircuits bounds the breaker map. Because the key carries the
+// model name and model names can arrive from requests (not only from
+// configured chains — unregistered names also report quotaExhaustedCode),
+// the map is bounded independently of configuration: when it is full of
+// circuits still doing their job, new pairs simply get no circuit, which
+// degrades to no-breaker behavior for them (they are attempted every time)
+// and never to less availability. 4096 pairs is far above any configured
+// chain fan-out and caps the map at a few hundred kilobytes.
+const maxAccountCircuits = 4096
+
 // AccountBreaker is a process-local circuit breaker keyed by provider account
 // plus model (provider name, a fingerprint of the configured credential, and
 // the model name). Once a leg reports structured quota exhaustion, that
@@ -44,6 +54,9 @@ type AccountBreaker struct {
 	mu       sync.Mutex
 	now      func() time.Time
 	accounts map[string]*accountCircuit
+	// maxCircuits bounds len(accounts); a field so tests can shrink it.
+	// Defaults to maxAccountCircuits.
+	maxCircuits int
 }
 
 // accountCircuit exists only while an account is not closed.
@@ -59,7 +72,28 @@ func NewAccountBreaker() *AccountBreaker {
 }
 
 func newAccountBreaker(now func() time.Time) *AccountBreaker {
-	return &AccountBreaker{mu: sync.Mutex{}, now: now, accounts: map[string]*accountCircuit{}}
+	return &AccountBreaker{now: now, accounts: map[string]*accountCircuit{}, maxCircuits: maxAccountCircuits}
+}
+
+// makeRoom evicts idle half-open circuits so a new pair can be inserted. A
+// circuit is evictable only when its cooldown has lapsed and it holds no
+// probe lease; circuits still working are never dropped. It reports whether
+// the map now has room.
+func (b *AccountBreaker) makeRoom() bool {
+	if len(b.accounts) < b.maxCircuits {
+		return true
+	}
+	now := b.now()
+	for key, c := range b.accounts {
+		if now.Before(c.openUntil) || c.probing {
+			continue
+		}
+		delete(b.accounts, key)
+		if len(b.accounts) < b.maxCircuits {
+			return true
+		}
+	}
+	return len(b.accounts) < b.maxCircuits
 }
 
 // admit decides whether a leg on account may start. probe reports that the
@@ -107,6 +141,14 @@ func (b *AccountBreaker) record(logger *slog.Logger, account string, probe bool,
 			return ""
 		}
 		if !exists {
+			if !b.makeRoom() {
+				// The map is full of circuits still in cooldown or probing.
+				// This pair gets no circuit: it is attempted on every request,
+				// which is exactly the no-breaker behavior for it.
+				logger.Warn("account circuit map full, leaving pair unguarded",
+					"account", shortFingerprint(account))
+				return ""
+			}
 			c = &accountCircuit{openUntil: time.Time{}, failures: 0, probing: false}
 			b.accounts[account] = c
 		}
@@ -214,11 +256,13 @@ func resolveLegAccount(opts Options, model string) legAccount {
 const accountLabelLen = 12
 
 // splitAccount returns the provider, the short fingerprint label and the
-// model name of an account+model breaker key. The credential hash is hex, so
-// the last ':' separates it from the provider; the model follows the '\x00'
-// separator. An old bare account key (no model) yields an empty model.
+// model name of an account+model breaker key. The credential hash is hex and
+// provider names come from configuration, so neither contains '\x00': the
+// first NUL is the separator and the model name may safely contain anything,
+// including further NULs. The last ':' before the fingerprint separates it
+// from the provider. An old bare account key (no model) yields an empty model.
 func splitAccount(key string) (provider, label, model string) {
-	if i := strings.LastIndexByte(key, 0); i >= 0 {
+	if i := strings.IndexByte(key, 0); i >= 0 {
 		model = key[i+1:]
 		key = key[:i]
 	}
@@ -234,10 +278,11 @@ func splitAccount(key string) (provider, label, model string) {
 }
 
 // shortFingerprint keeps logs correlatable without carrying the whole hash;
-// the model half of a breaker key never reaches it (logs carry model=).
+// the model half of a breaker key never reaches it (logs carry model=), and
+// the first NUL is the separator for the same reason as in splitAccount.
 func shortFingerprint(key string) string {
 	const keep = 12
-	if i := strings.LastIndexByte(key, 0); i >= 0 {
+	if i := strings.IndexByte(key, 0); i >= 0 {
 		key = key[:i]
 	}
 	for i := 0; i < len(key); i++ {

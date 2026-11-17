@@ -544,3 +544,93 @@ func TestWithoutBreakerQuotaExhaustionKeepsPlainFallback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "same account", resp.Text)
 }
+
+// A chain may repeat the same leg (the selector does not deduplicate). The
+// second occurrence must be skipped as exhausted-in-request, and when the
+// whole chain fails, fail-open must not retry it: the rejection is fresh
+// evidence from this very request, not a stale circuit.
+func TestDuplicatePairIsSkippedWithinOneRequest(t *testing.T) {
+	t.Parallel()
+	up := newScriptedUpstream(t)
+	up.script("a", quotaExhausted)
+	up.script("c", answer(t, "other provider"))
+	breaker := newAccountBreaker(newFakeClock().Now)
+	var log eventLog
+	opts := up.options("doom/a,doom/a,zai/c", WithAccountBreaker(breaker), WithAccountEventHook(log.record))
+
+	resp, err := Ask(context.Background(), PromptFromString("hi"), opts...)
+	require.NoError(t, err)
+	assert.Equal(t, "other provider", resp.Text)
+	assert.Equal(t, 1, up.calls("a"), "the repeated leg must not be attempted twice")
+	assert.Equal(t, []eventShape{
+		{Kind: AccountOpened, Provider: "doom", ModelName: "a"},
+		{Kind: AccountSkipped, Provider: "doom", ModelName: "a", SkipReason: SkipExhaustedInRequest},
+	}, shapes(log.take()))
+
+	// All-fail variant: fail-open retries refused (circuit-skipped) legs, but
+	// the pair that reported quota exhaustion in this request stays skipped.
+	up2 := newScriptedUpstream(t)
+	up2.script("a", quotaExhausted)
+	breaker2 := newAccountBreaker(newFakeClock().Now)
+	_, err = Ask(context.Background(), PromptFromString("hi"), up2.options("doom/a,doom/a", WithAccountBreaker(breaker2))...)
+	require.Error(t, err)
+	assert.True(t, isQuotaExhausted(err))
+	assert.Equal(t, 1, up2.calls("a"), "fail-open must not retry a pair exhausted in this request")
+}
+
+// The breaker map is bounded independently of the model names requests send:
+// once full of working circuits, further pairs get no circuit (attempted every
+// time, like no breaker), and lapsed circuits are evicted to make room.
+func TestBreakerCapsAccountModelEntries(t *testing.T) {
+	t.Parallel()
+	up := newScriptedUpstream(t)
+	for _, m := range []string{"m1", "m2", "m3"} {
+		up.script(m, quotaExhausted)
+	}
+	up.script("ok", answer(t, "fine"))
+	clock := newFakeClock()
+	breaker := newAccountBreaker(clock.Now)
+	breaker.maxCircuits = 2
+	ask := func(model string) error {
+		_, err := Ask(context.Background(), PromptFromString("hi"), up.options("doom/"+model, WithAccountBreaker(breaker))...)
+		return err
+	}
+
+	require.Error(t, ask("m1")) // circuit 1
+	require.Error(t, ask("m2")) // circuit 2
+	require.Error(t, ask("m3")) // map full, both circuits in cooldown: no circuit for m3
+	assert.Len(t, breaker.Circuits(), 2, "the map never exceeds its bound")
+
+	// An unguarded pair is attempted on every request instead of being skipped.
+	require.Error(t, ask("m3"))
+	assert.Equal(t, 2, up.calls("m3"), "a pair without a circuit must stay attemptable")
+	assert.Len(t, breaker.Circuits(), 2)
+
+	// After every cooldown lapses, opening a new circuit evicts idle ones to
+	// make room; the map stays within its bound.
+	clock.Advance(accountCooldownMax + time.Minute)
+	require.Error(t, ask("m3"))
+	circuits := breaker.Circuits()
+	assert.LessOrEqual(t, len(circuits), 2, "the bound is an invariant, not a one-shot")
+	names := map[string]bool{}
+	for _, c := range circuits {
+		names[c.ModelName] = true
+	}
+	assert.False(t, names["m1"], "a lapsed circuit is evicted to make room")
+	assert.True(t, names["m3"], "the fresh circuit is kept")
+}
+
+func TestSplitAccountHandlesNulModelNames(t *testing.T) {
+	t.Parallel()
+	key := "doom:abcdef0123456789\x00weird\x00model"
+	provider, label, model := splitAccount(key)
+	assert.Equal(t, "doom", provider)
+	assert.Equal(t, "abcdef012345", label)
+	assert.Equal(t, "weird\x00model", model, "the model name may itself contain NULs")
+	assert.Equal(t, "doom:abcdef012345", shortFingerprint(key))
+
+	provider, label, model = splitAccount("doom:abcdef0123456789")
+	assert.Equal(t, "doom", provider)
+	assert.Equal(t, "abcdef012345", label)
+	assert.Empty(t, model, "a bare legacy account key has no model half")
+}
